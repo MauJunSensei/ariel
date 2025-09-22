@@ -1,18 +1,54 @@
 # Third-party libraries
-import matplotlib.pyplot as plt
-import mujoco
 import numpy as np
+import mujoco
 from mujoco import viewer
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime
 
-# import prebuilt robot phenotypes
-from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
-from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
 # Local libraries
 from ariel.utils.renderers import video_renderer
 from ariel.utils.video_recorder import VideoRecorder
+from ariel.utils.runners import simple_runner
+from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
+
+
+
+# import prebuilt robot phenotypes
+from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 
 # Keep track of data / history
 HISTORY = []
+
+# Baseline task & fitness definition
+# Task: directed forward locomotion on SimpleFlatWorld
+# Fitness: forward displacement Δx of the robot core over the run duration
+def compute_forward_displacement(history:list) -> float:
+    if not history:
+        return 0.0
+    pos_data = np.array(history)
+    delta_x = float(pos_data[-1, 0] - pos_data[0, 0])
+    return delta_x
+
+def save_baseline_fitness(delta_x: float) -> None:
+    """Append fitness to CSV under __data__/A2_template/ for later plotting."""
+    try:
+        base_dir = os.path.dirname(__file__) or os.getcwd()
+    except Exception:
+        base_dir = os.getcwd()
+    out_dir = os.path.join(base_dir, "__data__", "A2_template")
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, "baseline_random.csv")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header_needed = not os.path.exists(csv_path)
+    try:
+        with open(csv_path, "a") as f:
+            if header_needed:
+                f.write("timestamp,delta_x\n")
+            f.write(f"{timestamp},{delta_x}\n")
+        print(f"Saved baseline fitness to: {csv_path}")
+    except Exception:
+        pass
 
 def random_move(model, data, to_track) -> None:
     """Generate random movements for the robot's joints.
@@ -54,9 +90,7 @@ def random_move(model, data, to_track) -> None:
 
     # Bound the control values to be within the hinge limits.
     # If a value goes outside the bounds it might result in jittery movement.
-    # data.ctrl = np.clip(data.ctrl, -np.pi/2, np.pi/2)
-    data.ctrl = [0 for i in range(len(data.ctrl))]
-    data.ctrl[0] = 1.5
+    data.ctrl = np.clip(data.ctrl, -np.pi/2, np.pi/2)
 
     # Save movement to history
     HISTORY.append(to_track[0].xpos.copy())
@@ -97,6 +131,20 @@ def show_qpos_history(history:list):
     plt.xlim(-max_range, max_range)
     plt.ylim(-max_range, max_range)
     
+    # Save figure alongside CSV for convenience
+    try:
+        base_dir = os.path.dirname(__file__) or os.getcwd()
+    except Exception:
+        base_dir = os.getcwd()
+    out_dir = os.path.join(base_dir, "__data__", "A2_template")
+    os.makedirs(out_dir, exist_ok=True)
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fig_path = os.path.join(out_dir, f"trajectory_{now}.png")
+    try:
+        plt.savefig(fig_path, dpi=200, bbox_inches="tight")
+        print(f"Saved trajectory plot to: {fig_path}")
+    except Exception:
+        pass
     plt.show()
 
 def main():
@@ -104,11 +152,13 @@ def main():
     # Initialise controller to controller to None, always in the beginning.
     mujoco.set_mjcb_control(None) # DO NOT REMOVE
     
-    # Initialise world
-    # Import environments from ariel.simulation.environments
-    world = SimpleFlatWorld()
+    # Initialise world 
+# Import environments from ariel.simulation.environments
 
-    # Initialise robot body
+    world = SimpleFlatWorld()
+    
+
+    # Initialise robot body 
     # YOU MUST USE THE GECKO BODY
     gecko_core = gecko()     # DO NOT CHANGE
 
@@ -131,27 +181,27 @@ def main():
     # This is called every time step to get the next action. 
     mujoco.set_mjcb_control(lambda m,d: random_move(m, d, to_track))
 
-    # This opens a viewer window and runs the simulation with the controller you defined
-    # If mujoco.set_mjcb_control(None), then you can control the limbs yourself.
-    # viewer.launch(
-    #     model=model,  # type: ignore
-    #     data=data,
-    # )
+    # Fixed-duration headless run for consistent evaluation time across runs
+    simple_runner(model=model, data=data, duration=25.0)
 
-    # Non-default VideoRecorder options
-    PATH_TO_VIDEO_FOLDER = "./__videos__"
-    video_recorder = VideoRecorder(output_folder=PATH_TO_VIDEO_FOLDER)
-
-    # Render with video recorder
-    video_renderer(
-        model,
-        data,
-        duration=30,
-        video_recorder=video_recorder,
-    )
-    
     show_qpos_history(HISTORY)
+    # Report baseline fitness (Δx) and save to CSV
+    fitness_dx = compute_forward_displacement(HISTORY)
+    print(f"Baseline fitness (Δx forward in meters): {fitness_dx:.6f}")
+    save_baseline_fitness(fitness_dx)
     # If you want to record a video of your simulation, you can use the video renderer.
+
+    # # Non-default VideoRecorder options
+    # PATH_TO_VIDEO_FOLDER = "./__videos__"
+    # video_recorder = VideoRecorder(output_folder=PATH_TO_VIDEO_FOLDER)
+
+    # # Render with video recorder
+    # video_renderer(
+    #     model,
+    #     data,
+    #     duration=30,
+    #     video_recorder=video_recorder,
+    # )
 
 if __name__ == "__main__":
     main()
