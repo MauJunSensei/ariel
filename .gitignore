@@ -265,3 +265,5 @@ RECYCLE.BIN/
 *.msp
 # Windows shortcuts
 *.lnk
+examples/_robogen_build.xml
+outcmaes/
