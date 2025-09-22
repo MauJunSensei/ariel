@@ -103,10 +103,20 @@ def show_qpos_history(history:list, env_name: str = None):
     # Create figure and axis
     plt.figure(figsize=(10, 6))
 
+    # Filter out any rows with NaN/Inf which can cause missing markers
+    mask = np.isfinite(pos_data).all(axis=1)
+    if not np.all(mask):
+        print(f"Filtered out {np.count_nonzero(~mask)} invalid trajectory points (NaN/Inf)")
+    pos_data = pos_data[mask]
+
     # Plot x,y trajectory
     plt.plot(pos_data[:, 0], pos_data[:, 1], 'b-', label='Path')
-    plt.plot(pos_data[0, 0], pos_data[0, 1], 'go', label='Start')
-    plt.plot(pos_data[-1, 0], pos_data[-1, 1], 'ro', label='End')
+
+    # Draw start and end with larger markers so they are visible on top
+    start = pos_data[0]
+    end = pos_data[-1]
+    plt.scatter([start[0]], [start[1]], c='green', s=80, edgecolors='k', zorder=5, label='Start')
+    plt.scatter([end[0]], [end[1]], c='red', s=80, edgecolors='k', zorder=6, label='End')
 
     # Add labels and title
     plt.xlabel('X Position')
@@ -118,11 +128,15 @@ def show_qpos_history(history:list, env_name: str = None):
     plt.legend()
     plt.grid(True)
 
-    # Set equal aspect ratio and center at (0,0)
+    # Set equal aspect ratio and compute axis limits from data extents
     plt.axis('equal')
-    max_range = max(abs(pos_data).max(), 0.3)  # ensure non-zero range
-    plt.xlim(-max_range, max_range)
-    plt.ylim(-max_range, max_range)
+    xmin, ymin = pos_data[:, 0].min(), pos_data[:, 1].min()
+    xmax, ymax = pos_data[:, 0].max(), pos_data[:, 1].max()
+    # Add a margin so markers aren't on the edge
+    xpad = max(0.1, 0.05 * (xmax - xmin) if xmax > xmin else 0.3)
+    ypad = max(0.1, 0.05 * (ymax - ymin) if ymax > ymin else 0.3)
+    plt.xlim(xmin - xpad, xmax + xpad)
+    plt.ylim(ymin - ypad, ymax + ypad)
 
     # Ensure __data__ directory exists next to this script
     try:
