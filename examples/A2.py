@@ -20,6 +20,7 @@ import cma
 import concurrent.futures
 import os
 from datetime import datetime
+import csv
 
 # import prebuilt robot phenotypes
 from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
@@ -103,12 +104,6 @@ def show_qpos_history(history:list, env_name: str = None):
     # Create figure and axis
     plt.figure(figsize=(10, 6))
 
-    # Filter out any rows with NaN/Inf which can cause missing markers
-    mask = np.isfinite(pos_data).all(axis=1)
-    if not np.all(mask):
-        print(f"Filtered out {np.count_nonzero(~mask)} invalid trajectory points (NaN/Inf)")
-    pos_data = pos_data[mask]
-
     # Plot x,y trajectory
     plt.plot(pos_data[:, 0], pos_data[:, 1], 'b-', label='Path')
 
@@ -155,8 +150,8 @@ def show_qpos_history(history:list, env_name: str = None):
     try:
         plt.savefig(filepath, dpi=200, bbox_inches='tight')
         print(f"Saved trajectory plot to: {filepath}")
-    except Exception as e:
-        print(f"Failed to save plot to {filepath}: {e}")
+    except Exception:
+        pass
 
     plt.show()
 
@@ -206,11 +201,10 @@ def evaluate_params_worker(x, duration: float, steps_per_loop: int, seed: int, e
 
     if len(local_history) == 0:
         return 0.0, []
-    # Score = start_y - min_y, where min_y is the minimum Y reached (furthest forward).
-    start_y = local_history[0][1]
-    ys = [_p[1] for _p in local_history]  # extract all y values
-    min_y = float(min(ys))
-    score = float(start_y - min_y)
+    # Score = Δx = end_x - start_x (directed forward locomotion along +X)
+    start_x = local_history[0][0]
+    end_x = local_history[-1][0]
+    score = float(end_x - start_x)
     return score, local_history
 
 def main():
@@ -218,7 +212,7 @@ def main():
 
     # ---- CMA-ES settings ----
     generations = 40
-    duration = 60.0  # seconds to simulate each candidate
+    duration = 60.0  # seconds to simulate each candidate (align with baseline)
     steps_per_loop = 1
     pop_size = 20
     # ------------------------
@@ -239,86 +233,98 @@ def main():
     x0 = np.zeros(param_dim)
     sigma0 = 0.5
 
-    # Seed handling: default seed 42 unless overridden via CLI
-    seed = getattr(main, "_cli_seed", 42)
-    np.random.seed(seed)
+    # Runs: repeat optimization 3 times with different seeds (as per spec)
+    runs = getattr(main, "_cli_runs", 3)
+    base_seed = getattr(main, "_cli_seed", 42)
 
-    cma_opts = {'popsize': pop_size, 'seed': int(seed)}
-    es = cma.CMAEvolutionStrategy(x0.tolist(), sigma0, cma_opts)
+    for run_idx in range(runs):
+        seed = int(base_seed) + run_idx
+        np.random.seed(seed)
 
-    best_solution = None
-    best_score = -np.inf
+        cma_opts = {'popsize': pop_size, 'seed': int(seed)}
+        es = cma.CMAEvolutionStrategy(x0.tolist(), sigma0, cma_opts)
 
-    # Run optimisation loop
-    eval_count = 0
-    # Parallel evaluation using processes
-    max_workers = os.cpu_count() or 1
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as exe:
-        while not es.stop() and es.countiter < generations:
-            solutions = es.ask()
-            # submit all solutions to the pool
-            futures = [exe.submit(evaluate_params_worker, s, duration, steps_per_loop, seed, idx, env_name) for idx, s in enumerate(solutions)]
-            scores = []
-            for fut, s in zip(futures, solutions):
-                score, hist = fut.result()
-                eval_count += 1
-                scores.append(-score)
-                if score > best_score:
-                    best_score = score
-                    best_solution = np.array(s)
-                    # save the history of the best
-                    HISTORY.clear()
-                    HISTORY.extend(hist)
-            es.tell(solutions, scores)
-            es.logger.add()
-            es.disp()
-            print(f"Gen {es.countiter:3d} best_score_so_far={best_score:.4f} evals={eval_count}")
+        best_solution = None
+        best_score = -np.inf
 
-    print("Training finished. Best score:", best_score)
+        # Prepare logging
+        try:
+            base_dir = os.path.dirname(__file__) or os.getcwd()
+        except Exception:
+            base_dir = os.getcwd()
+        out_dir = os.path.join(base_dir, "__data__", "A2", env_name)
+        os.makedirs(out_dir, exist_ok=True)
+        csv_path = os.path.join(out_dir, f"learning_curve_seed{seed}.csv")
+        with open(csv_path, "w", newline="") as fcsv:
+            writer = csv.writer(fcsv)
+            writer.writerow(["generation", "best_dx"])  # Δx per generation
 
-    # Launch the viewer and replay the best solution.
-    if best_solution is not None:
-        print("Launching viewer for best solution...")
-        # Recreate world/model/data and set callback with best parameters (DRY)
-        world, model, data, to_track, _ = build_world_and_model(env_name)
+            # Run optimisation loop
+            eval_count = 0
+            max_workers = os.cpu_count() or 1
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as exe:
+                while not es.stop() and es.countiter < generations:
+                    solutions = es.ask()
+                    futures = [exe.submit(evaluate_params_worker, s, duration, steps_per_loop, seed, idx, env_name) for idx, s in enumerate(solutions)]
+                    scores = []
+                    for fut, s in zip(futures, solutions):
+                        score, hist = fut.result()
+                        eval_count += 1
+                        scores.append(-score)  # CMA-ES minimizes
+                        if score > best_score:
+                            best_score = score
+                            best_solution = np.array(s)
+                            HISTORY.clear()
+                            HISTORY.extend(hist)
+                    es.tell(solutions, scores)
+                    writer.writerow([es.countiter, f"{best_score:.6f}"])
+                    print(f"gen {es.countiter:3d} best_dx={best_score:.4f} evals={eval_count}")
 
-        # Decode best solution parameters
-        x = best_solution
-        amps, phases, freq = decode_params(x, nu)
+        print(f"Run {run_idx+1}/{runs} finished. Best Δx (m): {best_score:.6f}")
 
-        def viz_controller(m: mujoco.MjModel, d: mujoco.MjData) -> None:
-            t = float(d.time)
-            targets = amps * np.sin(2 * np.pi * freq * t + phases)
-            delta = 0.05
-            d.ctrl += targets * delta
-            d.ctrl = np.clip(d.ctrl, -np.pi / 2, np.pi / 2)
-            if len(to_track) > 0:
-                HISTORY.append(to_track[0].xpos.copy())
+        # Replay best solution (only for the last run to avoid multiple viewers)
+        if (run_idx == runs - 1) and (best_solution is not None):
+            print("Launching viewer for best solution...")
+            world, model, data, to_track, _ = build_world_and_model(env_name)
+            x = best_solution
+            amps, phases, freq = decode_params(x, nu)
 
-        # Clear any previous history and start viewer
-        HISTORY.clear()
-        mujoco.set_mjcb_control(viz_controller)
-        video_flag = getattr(main, "_cli_video", False)
-        if video_flag:
-            PATH_TO_VIDEO_FOLDER = "./__videos__"
-            video_recorder = VideoRecorder(output_folder=PATH_TO_VIDEO_FOLDER, width=1280, height=960)
-            video_renderer(
-                model,
-                data,
-                duration=duration,
-                video_recorder=video_recorder,
-            )
+            def viz_controller(m: mujoco.MjModel, d: mujoco.MjData) -> None:
+                t = float(d.time)
+                targets = amps * np.sin(2 * np.pi * freq * t + phases)
+                delta = 0.05
+                d.ctrl += targets * delta
+                d.ctrl = np.clip(d.ctrl, -np.pi / 2, np.pi / 2)
+                if len(to_track) > 0:
+                    HISTORY.append(to_track[0].xpos.copy())
+
+            HISTORY.clear()
+            mujoco.set_mjcb_control(viz_controller)
+            video_flag = getattr(main, "_cli_video", False)
+            if video_flag:
+                PATH_TO_VIDEO_FOLDER = "./__videos__"
+                video_recorder = VideoRecorder(output_folder=PATH_TO_VIDEO_FOLDER, width=1280, height=960)
+                video_renderer(
+                    model,
+                    data,
+                    duration=duration,
+                    video_recorder=video_recorder,
+                )
+            else:
+                viewer.launch(model=model, data=data)
+            # Report Δx for the best replay
+            if len(HISTORY) >= 2:
+                dx_best = float(HISTORY[-1][0] - HISTORY[0][0])
+                print(f"Best run Δx (m): {dx_best:.6f}")
             show_qpos_history(HISTORY, env_name=env_name)
-        else:
-            viewer.launch(model=model, data=data)
-            show_qpos_history(HISTORY, env_name=env_name)
-        mujoco.set_mjcb_control(None)
+            mujoco.set_mjcb_control(None)
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="Random seed for numpy and CMA-ES (default: 42)")
+    parser.add_argument("--runs", type=int, default=3, help="Number of independent runs (seeds) to execute (default: 3)")
     parser.add_argument(
         "--env",
         type=str,
@@ -330,8 +336,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # Attach as attribute so main can read it (avoids changing signature)
     main._cli_seed = int(args.seed)
+    main._cli_runs = int(args.runs)
     main._cli_env = str(args.env)
     main._cli_video = bool(args.video)
     main()
-
-
