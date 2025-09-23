@@ -201,10 +201,11 @@ def evaluate_params_worker(x, duration: float, steps_per_loop: int, seed: int, e
 
     if len(local_history) == 0:
         return 0.0, []
-    # Score = Δx = end_x - start_x (directed forward locomotion along +X)
-    start_x = local_history[0][0]
-    end_x = local_history[-1][0]
-    score = float(end_x - start_x)
+    # Score = start_y - min_y (furthest forward along -Y)
+    start_y = local_history[0][1]
+    ys = [_p[1] for _p in local_history]
+    min_y = float(min(ys))
+    score = float(start_y - min_y)
     return score, local_history
 
 def main():
@@ -212,7 +213,7 @@ def main():
 
     # ---- CMA-ES settings ----
     generations = 40
-    duration = 60.0  # seconds to simulate each candidate (align with baseline)
+    duration = 60.0  # seconds to simulate each candidate
     steps_per_loop = 1
     pop_size = 20
     # ------------------------
@@ -340,3 +341,5 @@ if __name__ == "__main__":
     main._cli_env = str(args.env)
     main._cli_video = bool(args.video)
     main()
+
+
