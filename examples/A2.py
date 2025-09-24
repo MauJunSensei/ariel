@@ -21,6 +21,8 @@ import concurrent.futures
 import os
 from datetime import datetime
 import csv
+import json
+from pathlib import Path
 
 # import prebuilt robot phenotypes
 from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
@@ -211,84 +213,104 @@ def evaluate_params_worker(x, duration: float, steps_per_loop: int, seed: int, e
 def main():
     mujoco.set_mjcb_control(None)  # DO NOT REMOVE
 
-    # ---- CMA-ES settings ----
+    # ---- Fixed experiment config (edit here, no CLI) ----
+    env_label = "Rugged"  # choices: "SimpleFlat" or "Rugged"
+    base_seed = 42
+    runs = 3
     generations = 40
-    duration = 60.0  # seconds to simulate each candidate
+    duration = 60.0  # seconds per evaluation
     steps_per_loop = 1
     pop_size = 20
-    # ------------------------
+    out_root = Path("results")
+    # ----------------------------------------------------
 
-    # environment selection
-    env_name = getattr(main, "_cli_env", "flat")
-    valid_envs = ("flat", "rugged", "amphiteater", "amphitheatre", "boxy", "crater", "pyramid", "tilted")
-    if env_name not in valid_envs:
-        raise ValueError(f"env must be one of: {', '.join(valid_envs)}")
+    env_key = "flat" if env_label == "SimpleFlat" else "rugged"
 
-    # Create a temporary world to infer action dimension (nu)
-    _, _, _, _, nu = build_world_and_model(env_name)
-
-    # Parameterisation: for each joint -> amplitude, phase. plus a global freq.
+    # Infer action dimension
+    _, _, _, _, nu = build_world_and_model(env_key)
     param_dim = nu * 2 + 1
 
-    # CMA initialisation
-    x0 = np.zeros(param_dim)
-    sigma0 = 0.5
-
-    # Runs: repeat optimization 3 times with different seeds (as per spec)
-    runs = getattr(main, "_cli_runs", 3)
-    base_seed = getattr(main, "_cli_seed", 42)
+    # Static metadata
+    meta = {
+        "env": env_label,
+        "algo": "cmaes",
+        "duration_s": duration,
+        "population_size": pop_size,
+        "controller": "per-joint sinusoid (amp, phase, global freq)",
+        "fitness": "delta_y = start_y - min_y",
+        "param_dim": int(param_dim),
+    }
+    try:
+        import subprocess
+        meta["git_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+    except Exception:
+        meta["git_commit"] = None
 
     for run_idx in range(runs):
         seed = int(base_seed) + run_idx
         np.random.seed(seed)
 
-        cma_opts = {'popsize': pop_size, 'seed': int(seed)}
-        es = cma.CMAEvolutionStrategy(x0.tolist(), sigma0, cma_opts)
+        # CMA-ES init
+        x0 = np.zeros(param_dim)
+        sigma0 = 0.5
+        es = cma.CMAEvolutionStrategy(x0.tolist(), sigma0, {'popsize': pop_size, 'seed': int(seed)})
 
-        best_solution = None
-        best_score = -np.inf
+        # Output dirs per seed
+        run_dir = out_root / env_label / "cmaes" / f"seed_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = run_dir / "metrics.csv"
+        final_path = run_dir / "final.json"
+        params_path = run_dir / "params.json"
 
-        # Prepare logging
-        try:
-            base_dir = os.path.dirname(__file__) or os.getcwd()
-        except Exception:
-            base_dir = os.getcwd()
-        out_dir = os.path.join(base_dir, "__data__", "A2", env_name)
-        os.makedirs(out_dir, exist_ok=True)
-        csv_path = os.path.join(out_dir, f"learning_curve_seed{seed}.csv")
-        with open(csv_path, "w", newline="") as fcsv:
-            writer = csv.writer(fcsv)
-            writer.writerow(["generation", "best_dx"])  # Δx per generation
+        with params_path.open("w") as f:
+            json.dump({**meta, "seed": seed, "generations": generations}, f, indent=2)
 
-            # Run optimisation loop
+        with metrics_path.open("w", newline="") as fcsv:
+            writer = csv.DictWriter(fcsv, fieldnames=["generation", "evaluations", "best_fitness", "mean_fitness", "timestamp"]) 
+            writer.writeheader()
+
             eval_count = 0
+            best_overall = -np.inf
+            best_solution = None
+
             max_workers = os.cpu_count() or 1
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as exe:
                 while not es.stop() and es.countiter < generations:
                     solutions = es.ask()
-                    futures = [exe.submit(evaluate_params_worker, s, duration, steps_per_loop, seed, idx, env_name) for idx, s in enumerate(solutions)]
-                    scores = []
+                    futures = [exe.submit(evaluate_params_worker, s, duration, steps_per_loop, seed, idx, env_key) for idx, s in enumerate(solutions)]
+                    losses = []
+                    fitnesses = []
                     for fut, s in zip(futures, solutions):
-                        score, hist = fut.result()
+                        score, _ = fut.result()
                         eval_count += 1
-                        scores.append(-score)  # CMA-ES minimizes
-                        if score > best_score:
-                            best_score = score
+                        fitnesses.append(score)
+                        losses.append(-score)
+                        if score > best_overall:
+                            best_overall = score
                             best_solution = np.array(s)
-                            HISTORY.clear()
-                            HISTORY.extend(hist)
-                    es.tell(solutions, scores)
-                    writer.writerow([es.countiter, f"{best_score:.6f}"])
-                    print(f"gen {es.countiter:3d} best_dx={best_score:.4f} evals={eval_count}")
+                    es.tell(solutions, losses)
+                    mean_fit = float(np.mean(fitnesses)) if fitnesses else None
+                    writer.writerow({
+                        "generation": es.countiter,
+                        "evaluations": eval_count,
+                        "best_fitness": float(best_overall),
+                        "mean_fitness": "" if mean_fit is None else float(mean_fit),
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    })
 
-        print(f"Run {run_idx+1}/{runs} finished. Best Δx (m): {best_score:.6f}")
+        with final_path.open("w") as f:
+            json.dump({
+                "final_best_fitness": float(best_overall),
+                "env": env_label,
+                "algo": "cmaes",
+                "seed": int(seed),
+                "generations": int(generations),
+            }, f, indent=2)
 
-        # Replay best solution (only for the last run to avoid multiple viewers)
+        # Replay best for the last run only
         if (run_idx == runs - 1) and (best_solution is not None):
-            print("Launching viewer for best solution...")
-            world, model, data, to_track, _ = build_world_and_model(env_name)
-            x = best_solution
-            amps, phases, freq = decode_params(x, nu)
+            world, model, data, to_track, _ = build_world_and_model(env_key)
+            amps, phases, freq = decode_params(best_solution, nu)
 
             def viz_controller(m: mujoco.MjModel, d: mujoco.MjData) -> None:
                 t = float(d.time)
@@ -301,23 +323,8 @@ def main():
 
             HISTORY.clear()
             mujoco.set_mjcb_control(viz_controller)
-            video_flag = getattr(main, "_cli_video", False)
-            if video_flag:
-                PATH_TO_VIDEO_FOLDER = "./__videos__"
-                video_recorder = VideoRecorder(output_folder=PATH_TO_VIDEO_FOLDER, width=1280, height=960)
-                video_renderer(
-                    model,
-                    data,
-                    duration=duration,
-                    video_recorder=video_recorder,
-                )
-            else:
-                viewer.launch(model=model, data=data)
-            # Report Δx for the best replay
-            if len(HISTORY) >= 2:
-                dx_best = float(HISTORY[-1][0] - HISTORY[0][0])
-                print(f"Best run Δx (m): {dx_best:.6f}")
-            show_qpos_history(HISTORY, env_name=env_name)
+            viewer.launch(model=model, data=data)
+            show_qpos_history(HISTORY, env_name=env_label)
             mujoco.set_mjcb_control(None)
 
 if __name__ == "__main__":

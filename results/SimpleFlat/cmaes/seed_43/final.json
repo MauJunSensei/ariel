@@ -1,0 +1,7 @@
+{
+  "final_best_fitness": 6.896041100014036,
+  "env": "SimpleFlat",
+  "algo": "cmaes",
+  "seed": 43,
+  "generations": 40
+}

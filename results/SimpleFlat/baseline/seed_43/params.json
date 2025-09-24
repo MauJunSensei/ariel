@@ -1,0 +1,9 @@
+{
+  "env": "SimpleFlat",
+  "algo": "baseline",
+  "seed": 43,
+  "generations": 1,
+  "duration_s": 60.0,
+  "controller": "random delta",
+  "fitness": "delta_y = start_y - min_y"
+}

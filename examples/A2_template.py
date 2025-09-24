@@ -5,12 +5,16 @@ from mujoco import viewer
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
+import csv
+import json
+from pathlib import Path
 
 # Local libraries
 from ariel.utils.renderers import video_renderer
 from ariel.utils.video_recorder import VideoRecorder
 from ariel.utils.runners import simple_runner
 from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
+from ariel.simulation.environments.rugged_heightmap import RuggedTerrainWorld
 
 
 
@@ -19,6 +23,14 @@ from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 
 # Keep track of data / history
 HISTORY = []
+
+# -------- Minimal experiment config (edit here) --------
+ENV_LABEL = "Rugged"  # "SimpleFlat" or "Rugged"
+BASE_SEED = 42
+RUNS = 3                   # run the baseline exactly 3 times
+DURATION_S = 60.0          # fixed horizon per run
+OUT_ROOT = Path("results")
+# ------------------------------------------------------
 
 # Baseline task & fitness definition
 # Task: directed forward locomotion on SimpleFlatWorld
@@ -29,6 +41,14 @@ def compute_forward_displacement(history:list) -> float:
     pos_data = np.array(history)
     delta_x = float(pos_data[-1, 0] - pos_data[0, 0])
     return delta_x
+
+def compute_forward_delta_y(history:list) -> float:
+    if not history:
+        return 0.0
+    pos = np.array(history)
+    start_y = float(pos[0, 1])
+    min_y = float(np.min(pos[:, 1]))
+    return start_y - min_y
 
 def save_baseline_fitness(delta_x: float) -> None:
     """Append fitness to CSV under __data__/A2_template/ for later plotting."""
@@ -148,47 +168,75 @@ def show_qpos_history(history:list):
     plt.show()
 
 def main():
-    """Main function to run the simulation with random movements."""
-    # Initialise controller to controller to None, always in the beginning.
-    mujoco.set_mjcb_control(None) # DO NOT REMOVE
-    
-    # Initialise world 
-# Import environments from ariel.simulation.environments
+    """Baseline random controller: run exactly RUNS times and save results like A2."""
+    mujoco.set_mjcb_control(None)  # DO NOT REMOVE
 
-    world = SimpleFlatWorld()
-    
+    env_key = "flat" if ENV_LABEL == "SimpleFlat" else "rugged"
+    algo_label = "baseline"
+    run_root = OUT_ROOT / ENV_LABEL / algo_label
+    run_root.mkdir(parents=True, exist_ok=True)
 
-    # Initialise robot body 
-    # YOU MUST USE THE GECKO BODY
-    gecko_core = gecko()     # DO NOT CHANGE
+    for run_idx in range(RUNS):
+        seed = BASE_SEED + run_idx
+        np.random.seed(seed)
 
-    # Spawn robot in the world
-    # Check docstring for spawn conditions
-    world.spawn(gecko_core.spec, spawn_position=[0, 0, 0])
-    
-    # Generate the model and data
-    # These are standard parts of the simulation USE THEM AS IS, DO NOT CHANGE
-    model = world.spec.compile()
-    data = mujoco.MjData(model) # type: ignore
+        # Build world and robot (retain original lines)
+        world = SimpleFlatWorld() if env_key == "flat" else RuggedTerrainWorld()
+        gecko_core = gecko()     # DO NOT CHANGE
+        world.spawn(gecko_core.spec, spawn_position=[0, 0, 0])
+        model = world.spec.compile()
+        data = mujoco.MjData(model) # type: ignore
 
-    # Initialise data tracking
-    # to_track is automatically updated every time step
-    # You do not need to touch it.
-    geoms = world.spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_GEOM)
-    to_track = [data.bind(geom) for geom in geoms if "core" in geom.name]
+        geoms = world.spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_GEOM)
+        to_track = [data.bind(geom) for geom in geoms if "core" in geom.name]
 
-    # Set the control callback function
-    # This is called every time step to get the next action. 
-    mujoco.set_mjcb_control(lambda m,d: random_move(m, d, to_track))
+        # Run a single fixed-duration episode
+        HISTORY.clear()
+        mujoco.set_mjcb_control(lambda m, d: random_move(m, d, to_track))
+        simple_runner(model=model, data=data, duration=DURATION_S)
+        mujoco.set_mjcb_control(None)
 
-    # Fixed-duration headless run for consistent evaluation time across runs
-    simple_runner(model=model, data=data, duration=25.0)
+        # Compute fitness (Δy), save like A2
+        dy = compute_forward_delta_y(HISTORY)
 
-    show_qpos_history(HISTORY)
-    # Report baseline fitness (Δx) and save to CSV
-    fitness_dx = compute_forward_displacement(HISTORY)
-    print(f"Baseline fitness (Δx forward in meters): {fitness_dx:.6f}")
-    save_baseline_fitness(fitness_dx)
+        seed_dir = run_root / f"seed_{seed}"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = seed_dir / "metrics.csv"
+        final_path = seed_dir / "final.json"
+        params_path = seed_dir / "params.json"
+
+        with params_path.open("w") as f:
+            json.dump({
+                "env": ENV_LABEL,
+                "algo": algo_label,
+                "seed": int(seed),
+                "generations": 1,
+                "duration_s": float(DURATION_S),
+                "controller": "random delta",
+                "fitness": "delta_y = start_y - min_y",
+            }, f, indent=2)
+
+        with metrics_path.open("w", newline="") as fcsv:
+            writer = csv.DictWriter(fcsv, fieldnames=["generation", "evaluations", "best_fitness", "mean_fitness", "timestamp"]) 
+            writer.writeheader()
+            writer.writerow({
+                "generation": 1,
+                "evaluations": 1,
+                "best_fitness": float(dy),
+                "mean_fitness": "",
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            })
+
+        with final_path.open("w") as f:
+            json.dump({
+                "final_best_fitness": float(dy),
+                "env": ENV_LABEL,
+                "algo": algo_label,
+                "seed": int(seed),
+                "generations": 1,
+            }, f, indent=2)
+
+    print(f"Baseline runs saved under: {run_root}")
     # If you want to record a video of your simulation, you can use the video renderer.
 
     # # Non-default VideoRecorder options

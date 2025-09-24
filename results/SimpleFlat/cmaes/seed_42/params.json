@@ -1,0 +1,12 @@
+{
+  "env": "SimpleFlat",
+  "algo": "cmaes",
+  "duration_s": 60.0,
+  "population_size": 20,
+  "controller": "per-joint sinusoid (amp, phase, global freq)",
+  "fitness": "delta_y = start_y - min_y",
+  "param_dim": 17,
+  "git_commit": "682f7c85a61fe187c7c03c45f46e67c9ab2be7b7",
+  "seed": 42,
+  "generations": 40
+}

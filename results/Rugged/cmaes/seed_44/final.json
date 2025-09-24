@@ -1,0 +1,7 @@
+{
+  "final_best_fitness": 1.821227198133224,
+  "env": "Rugged",
+  "algo": "cmaes",
+  "seed": 44,
+  "generations": 40
+}
