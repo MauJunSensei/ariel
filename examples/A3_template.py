@@ -26,6 +26,7 @@ from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
+from ariel.body_phenotypes.robogen_lite.config import ModuleType
 
 # Type Checking
 if TYPE_CHECKING:
@@ -38,11 +39,13 @@ type ViewerTypes = Literal["launcher", "video", "simple", "no_control", "frame"]
 SEED = 42
 RNG = np.random.default_rng(SEED)
 
-# --- DATA SETUP ---
+# --- DATA SETUP --- #
 SCRIPT_NAME = __file__.split("/")[-1][:-3]
 CWD = Path.cwd()
 DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(exist_ok=True)
+GRAPHS_DIR = DATA / "graphs"
+GRAPHS_DIR.mkdir(exist_ok=True)
 
 # Global variables
 SPAWN_POS = [-0.8, 0, 0.1]
@@ -153,6 +156,146 @@ def nn_controller(
 
     # Scale the outputs
     return outputs * np.pi
+def _build_body_from_genotype(
+    num_modules: int,
+    genotype: list[npt.NDArray[np.float32]],
+):
+    nde = NeuralDevelopmentalEncoding(number_of_modules=num_modules)
+    p_matrices = nde.forward(genotype)
+
+    hpd = HighProbabilityDecoder(num_modules)
+    robot_graph = hpd.probability_matrices_to_graph(
+        p_matrices[0],
+        p_matrices[1],
+        p_matrices[2],
+    )
+    core = construct_mjspec_from_graph(robot_graph)
+    return robot_graph, core
+
+
+def _random_genotype(gene_size: int) -> list[npt.NDArray[np.float32]]:
+    return [
+        RNG.random(gene_size).astype(np.float32),
+        RNG.random(gene_size).astype(np.float32),
+        RNG.random(gene_size).astype(np.float32),
+    ]
+
+
+def _quick_viability_score(
+    graph: "DiGraph",
+    core: Any,
+    *,
+    run_seconds: float = 1.2,
+) -> float:
+    # Graph checks
+    num_nodes = graph.number_of_nodes()
+    hinge_count = sum(1 for _, d in graph.nodes(data=True) if d["type"] == ModuleType.HINGE.name)
+    if num_nodes < 6 or hinge_count < 2 or num_nodes > NUM_OF_MODULES:
+        return -np.inf
+
+    # Minimal headless run in OlympicArena with tiny oscillatory control
+    try:
+        world = OlympicArena()
+        # Avoid pre-step bounding-box correction (can cause instability for random bodies)
+        world.spawn(
+            core.spec,
+            spawn_position=SPAWN_POS.copy(),
+            small_gap=0.02,
+            correct_for_bounding_box=False,
+        )
+        model = world.spec.compile()
+        if model.nu == 0:
+            return -np.inf
+        data = mj.MjData(model)
+    except Exception:
+        return -np.inf
+
+    def baseline_ctrl(m: mj.MjModel, d: mj.MjData) -> None:
+        d.ctrl[:] = 0.2 * np.sin(2.0 * d.time)
+
+    mj.set_mjcb_control(baseline_ctrl)
+    dt = model.opt.timestep
+    steps = int(run_seconds / dt)
+
+    # Track body named "core" if present; fallback to root qpos x otherwise
+    try:
+        core_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "core")
+        x0 = float(data.xpos[core_bid, 0])
+    except Exception:
+        x0 = float(data.qpos[0]) if len(data.qpos) > 0 else 0.0
+
+    for _ in range(steps):
+        mj.mj_step(model, data)
+        if not np.isfinite(data.qpos).all():
+            return -np.inf
+
+    try:
+        x1 = float(data.xpos[core_bid, 0])
+    except Exception:
+        x1 = float(data.qpos[0]) if len(data.qpos) > 0 else 0.0
+    disp = abs(x1 - x0)
+    return disp
+
+
+def _save_graph(graph: "DiGraph", save_path: Path) -> None:
+    save_graph_as_json(graph, save_path)
+
+
+def sample_and_select_bodies(
+    *,
+    total_trials: int = 500,
+    gene_size: int = 64,
+    top_k: int = 50,
+    seeds: list[int] | None = None,
+) -> list[tuple[float, "DiGraph", Any]]:
+    if seeds is None:
+        seeds = [42, 43, 44, 45, 46]
+
+    per_seed = max(1, total_trials // len(seeds))
+    candidates: list[tuple[float, "DiGraph", Any]] = []
+
+    for s in seeds:
+        local_rng = np.random.default_rng(s)
+        for _ in range(per_seed):
+            genotype = [
+                local_rng.random(gene_size).astype(np.float32),
+                local_rng.random(gene_size).astype(np.float32),
+                local_rng.random(gene_size).astype(np.float32),
+            ]
+            graph, core = _build_body_from_genotype(NUM_OF_MODULES, genotype)
+            score = _quick_viability_score(graph, core)
+            candidates.append((score, graph, core))
+
+    # Rank and take top_k
+    candidates.sort(key=lambda x: (np.isfinite(x[0]), x[0]), reverse=True)
+    top = [c for c in candidates if np.isfinite(c[0])][:top_k]
+
+    # Persist graphs and manifest
+    manifest = []
+    for rank, (score, graph, _core) in enumerate(top, start=1):
+        graph_path = GRAPHS_DIR / f"top_{rank:02d}.json"
+        _save_graph(graph, graph_path)
+        manifest.append({"rank": rank, "score": float(score), "graph": str(graph_path.name)})
+
+    # Save worst (for completeness)
+    worst = candidates[-1]
+    _save_graph(worst[1], GRAPHS_DIR / "worst.json")
+
+    # Freeze best body for later use
+    if top:
+        best_graph = top[0][1]
+        save_graph_as_json(best_graph, DATA / "robot_graph_best.json")
+
+    # Save manifest
+    try:
+        import json
+        with (DATA / "screening_manifest.json").open("w", encoding="utf-8") as f:
+            json.dump({"total_trials": total_trials, "seeds": seeds, "top": manifest}, f, indent=2)
+    except Exception:
+        pass
+
+    return top
+
 
 
 def experiment(
@@ -239,27 +382,15 @@ def experiment(
 def main() -> None:
     """Entry point."""
     # ? ------------------------------------------------------------------ #
-    genotype_size = 64
-    type_p_genes = RNG.random(genotype_size).astype(np.float32)
-    conn_p_genes = RNG.random(genotype_size).astype(np.float32)
-    rot_p_genes = RNG.random(genotype_size).astype(np.float32)
-
-    genotype = [
-        type_p_genes,
-        conn_p_genes,
-        rot_p_genes,
-    ]
-
-    nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES)
-    p_matrices = nde.forward(genotype)
-
-    # Decode the high-probability graph
-    hpd = HighProbabilityDecoder(NUM_OF_MODULES)
-    robot_graph: DiGraph[Any] = hpd.probability_matrices_to_graph(
-        p_matrices[0],
-        p_matrices[1],
-        p_matrices[2],
+    # Multi-seed screening: sample many bodies, keep top-50, freeze best
+    console.rule("Sampling bodies and selecting best")
+    top_candidates = sample_and_select_bodies(
+        total_trials=500,
+        gene_size=64,
+        top_k=50,
+        seeds=[42, 43, 44, 45, 46],
     )
+    robot_graph: DiGraph[Any] = top_candidates[0][1]
 
     # ? ------------------------------------------------------------------ #
     # Save the graph to a file
