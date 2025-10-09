@@ -1,27 +1,31 @@
-"""Assignment 3: Robot Olympics - Controller Evolution for Modular Robots.
+"""Assignment 3: Robot Olympics - Evolving Body (via NDE) and Controller.
 
-This implementation focuses on evolving an effective locomotion controller for a fixed
-hexapod robot body to navigate the OlympicArena environment.
+This implementation evolves modular robot bodies using the Neural Developmental
+Encoder (NDE) and, for each candidate morphology, evolves a sinusoidal controller
+using CMA-ES to maximize forward displacement in the OlympicArena.
 
-Body Design:
-- Fixed 6-legged hexapod structure (core + mid + back bricks, 6 actuated legs)
-- Symmetric leg configuration with 45° outward angles for stability
-- 6 actuators (one hinge per leg) providing locomotion degrees of freedom
+Body Evolution (NDE-based):
+- Representation: three real-valued vectors fed to the NDE
+- Decoder: High-Probability Decoder produces a directed graph morphology
+- Guardrails: drop NONE nodes, keep only the component reachable from core, require
+  at least one actuator, require successful compile/spawn in OlympicArena
+- Selection: simple (mu+lambda) evolution over NDE input vectors with Gaussian mutation
 
 Controller Evolution:
 - Algorithm: CMA-ES (Covariance Matrix Adaptation Evolution Strategy)
-- Controller type: Sinusoidal CPG (Central Pattern Generator)
-- Parameters evolved: 13 values (6 amplitudes + 6 phases + 1 frequency)
-- Training budget: 400 CMA-ES evaluations over ~50 generations
-- Evaluation duration: 30 seconds per trial
+- Controller: Sinusoidal CPG (per-actuator amps and phases, plus global frequency)
+- Parameters evolved: 2*nu + 1
+- Training budgets:
+  - Learnability probe for body scoring: short (e.g., 80-120 evals, 10-15s)
+  - Final training on the selected body: longer (e.g., 400 evals, 30s)
 
-Fitness Function:
-- Primary objective: Forward displacement in OlympicArena (negative Y direction)
-- Bonuses: Consistent forward progress, reaching distance milestones
-- Penalties: Excessive sideways drift, instability
+Fitness:
+- Primary objective: forward displacement in OlympicArena (negative Y direction)
+- Bonuses: consistent forward progress, reaching distance milestones
+- Penalties: excessive sideways drift, instability
 
-The evolutionary process discovers coordinated leg movements that maximize forward
-locomotion through the challenging Olympic arena terrain.
+This pipeline is designed to comply with the assignment requirements: evolve the body
+using the provided NDE and evolve the controller with an EA (CMA-ES).
 """
 
 # Standard library
@@ -50,6 +54,9 @@ from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
+from ariel.body_phenotypes.robogen_lite.constructor import construct_mjspec_from_graph
+from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import HighProbabilityDecoder
+from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
 from ariel.body_phenotypes.robogen_lite.config import ModuleFaces
 from ariel.body_phenotypes.robogen_lite.modules.core import CoreModule
 from ariel.body_phenotypes.robogen_lite.modules.brick import BrickModule
@@ -183,67 +190,59 @@ def nn_controller(
 
     # Scale the outputs
     return outputs * np.pi
-def _build_simple_robot_from_genotype(genotype: list[npt.NDArray[np.float32]]) -> CoreModule:
-    """Build robot from one of several pre-validated templates.
-    
-    Genotype selects from 8 known-good body configurations:
-    - g0[0] selects template (0-7 mapped to 8 variants)
-    
-    All templates use: core + mid brick + back brick + 6 legs (better stability)
-    Variants differ in leg rotations (pre-tested safe angles)
+def _nde_generate_core(
+    type_vec: npt.NDArray[np.float32],
+    conn_vec: npt.NDArray[np.float32],
+    rot_vec: npt.NDArray[np.float32],
+    *,
+    max_modules: int = 12,
+) -> CoreModule | None:
+    """Generate a body with NDE+decoder and return CoreModule or None if invalid.
+
+    Guardrails:
+    - Drop NONE nodes from the decoded graph
+    - Keep only the connected component reachable from core
+    - Enforce at least one actuator (hinge) and <= max_modules total
+    - Verify compile and spawn in OlympicArena
     """
-    g0, g1, g2 = genotype
-    
-    # Select template (8 variants for 6-legged robots)
-    template_id = int(g0[0] * 8) % 8
-    
-    # Template configurations: [front-left, front-right, mid-left, mid-right, back-left, back-right]
-    templates = [
-        [45, -45, 45, -45, 45, -45],     # Hexapod-like (all symmetric)
-        [30, -30, 45, -45, 60, -60],     # Progressive angles
-        [60, -60, 45, -45, 30, -30],     # Reverse progressive
-        [45, -45, 0, 0, 45, -45],        # Mid legs straight
-        [0, 0, 45, -45, 45, -45],        # Front legs straight
-        [45, -45, 45, -45, 0, 0],        # Back legs straight
-        [90, -90, 45, -45, 45, -45],     # Front wide spread
-        [45, -45, 45, -45, 90, -90],     # Back wide spread
-    ]
-    
-    rotations = templates[template_id]
-    
-    core = CoreModule(index=0)
-    
-    # Mid brick (for middle legs) - attached to core's BACK
-    mid = BrickModule(index=1)
-    mid.rotate(180)
-    core.sites[ModuleFaces.BACK].attach_body(mid.body, prefix="mid_")
-    
-    # Back brick (for rear legs) - attached to mid's FRONT (since bricks only have FRONT/LEFT/RIGHT)
-    back = BrickModule(index=2)
-    mid.sites[ModuleFaces.FRONT].attach_body(back.body, prefix="back_")
-    
-    idx = 3
-    
-    # 6 legs with template rotations
-    leg_configs = [
-        (core, ModuleFaces.LEFT, "fl", rotations[0]),
-        (core, ModuleFaces.RIGHT, "fr", rotations[1]),
-        (mid, ModuleFaces.LEFT, "ml", rotations[2]),
-        (mid, ModuleFaces.RIGHT, "mr", rotations[3]),
-        (back, ModuleFaces.LEFT, "bl", rotations[4]),
-        (back, ModuleFaces.RIGHT, "br", rotations[5]),
-    ]
-    
-    for parent, face, name, rotation in leg_configs:
-        leg = HingeModule(index=idx)
-        leg.rotate(rotation)
-        idx += 1
-        parent.sites[face].attach_body(leg.body, prefix=f"{name}_leg_")
-        
-        flipper = BrickModule(index=idx)
-        idx += 1
-        leg.sites[ModuleFaces.FRONT].attach_body(flipper.body, prefix=f"{name}_flip_")
-                
+    try:
+        nde = NeuralDevelopmentalEncoding(number_of_modules=max_modules)
+        p_types, p_conns, p_rots = nde.forward([type_vec, conn_vec, rot_vec])
+        dec = HighProbabilityDecoder(max_modules)
+        g: nx.DiGraph = dec.probability_matrices_to_graph(p_types, p_conns, p_rots)
+    except Exception:
+        return None
+
+    # Remove NONE nodes by attribute
+    to_remove: list[int] = []
+    for n, d in g.nodes(data=True):
+        if str(d.get("type", "")).upper() == "NONE":
+            to_remove.append(n)
+    if to_remove:
+        g.remove_nodes_from(to_remove)
+    if g.number_of_nodes() == 0:
+        return None
+
+    # Keep only component reachable from a node labeled CORE if any
+    core_nodes = [n for n, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "CORE"]
+    if core_nodes:
+        core_n = core_nodes[0]
+        reachable = nx.descendants(g, core_n) | {core_n}
+        g = g.subgraph(reachable).copy()
+    if g.number_of_nodes() == 0:
+        return None
+
+    # Count actuators
+    num_hinges = sum(1 for _, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "HINGE")
+    if num_hinges == 0 or g.number_of_nodes() > max_modules:
+        return None
+
+    # Build MjSpec and check compile (robot-only, no arena spawn here)
+    try:
+        core = construct_mjspec_from_graph(g)
+        _ = core.spec.compile()
+    except Exception:
+        return None
     return core
 
 
@@ -311,8 +310,11 @@ def _probe_body_with_cma(genotype: list[npt.NDArray[np.float32]], idx: int, *, d
     """Train a controller for a body using CMA-ES (A2 algorithm)."""
     console.log({"training_body": idx})
     
-    # Build fresh robot from genotype
-    core = _build_simple_robot_from_genotype(genotype)
+    # Build fresh robot from genotype (NDE-based)
+    core = _nde_generate_core(genotype[0], genotype[1], genotype[2], max_modules=12)
+    if core is None:
+        console.log({"body": idx, "error": "nde_invalid"})
+        return -np.inf, np.array([])
     
     try:
         world = OlympicArena()
@@ -604,18 +606,79 @@ def experiment(
 def main() -> None:
     """Entry point."""
     # ? ------------------------------------------------------------------ #
-    # Stage 1: Build fixed hexapod body
-    console.rule("Stage 1: Building Fixed Hexapod Body")
+    # Stage 1: Evolve NDE input vectors to obtain a viable body
+    console.rule("Stage 1: Evolving Body via NDE (guardrailed)")
     gene_size = 64
-    genotype = _random_genotype(gene_size)
-    genotype[0][0] = 0.0625  # Template 0 (symmetric hexapod, 45° legs)
-    console.log({"body": "6-legged_hexapod", "template": 0, "actuators": 6})
-    
-    # Stage 2: Evolve controller with CMA-ES
+    rng = np.random.default_rng(SEED)
+    mu = 6
+    lambd = 12
+    generations = 8
+    sigma_mut = 0.15
+
+    # Initialize population of NDE vectors
+    population: list[list[npt.NDArray[np.float32]]] = [
+        [
+            rng.random(gene_size).astype(np.float32),
+            rng.random(gene_size).astype(np.float32),
+            rng.random(gene_size).astype(np.float32),
+        ]
+        for _ in range(mu)
+    ]
+
+    def score_body(geno: list[npt.NDArray[np.float32]]) -> tuple[float, Any | None]:
+        core = _nde_generate_core(geno[0], geno[1], geno[2], max_modules=12)
+        if core is None:
+            return -np.inf, None
+        g = nx.DiGraph()
+        g.add_node(0, type="CORE")
+        return _quick_viability_score(g, core, run_seconds=1.0), core
+
+    best_body: tuple[float, Any, list[npt.NDArray[np.float32]]] | None = None
+    for gen in range(generations):
+        console.log({"nde_gen_start": gen + 1, "pop": len(population)})
+        scored: list[tuple[float, Any | None, list[npt.NDArray[np.float32]]]] = []
+        for i, ind in enumerate(population):
+            s, core_tmp = score_body(ind)
+            scored.append((s, core_tmp, ind))
+            if (i + 1) % 3 == 0:
+                console.log({"nde_progress": f"{i+1}/{len(population)}", "best_so_far": float(np.nanmax([r[0] for r in scored])) if scored else None})
+        ranked = sorted(scored, key=lambda x: x[0], reverse=True)
+        if best_body is None or ranked[0][0] > best_body[0]:
+            best_body = (ranked[0][0], ranked[0][1], [a.copy() for a in ranked[0][2]])
+        console.log({"nde_gen": gen + 1, "best_viability": float(ranked[0][0])})
+        # Selection + mutation to produce next population
+        elites = [geno for _, _core, geno in ranked[: max(2, mu // 2)]]
+        offspring: list[list[npt.NDArray[np.float32]]] = []
+        while len(offspring) < lambd:
+            parent = elites[rng.integers(0, len(elites))]
+            child = [
+                np.clip(p + rng.normal(0, sigma_mut, size=p.shape).astype(np.float32), 0.0, 1.0)
+                for p in parent
+            ]
+            offspring.append(child)
+        population = elites + offspring
+        population = population[:mu]
+
+    if best_body is None or not np.isfinite(best_body[0]) or best_body[0] <= 0:
+        console.log({"error": "no_viable_body_from_nde"})
+        return
+
+    best_viab, best_core, nde_genotype = best_body
+    console.log({"nde_body_selected": True, "viability": float(best_viab)})
+    # One-time arena spawn check now using the already built core
+    try:
+        world_chk = OlympicArena()
+        world_chk.spawn(best_core.spec, spawn_position=SPAWN_POS.copy(), small_gap=0.02, correct_for_bounding_box=False)
+        _ = world_chk.spec.compile()
+        console.log({"arena_check": "ok"})
+    except Exception as e:
+        console.log({"arena_check": "fail", "msg": str(e)[:120]})
+        return
+
+    # Stage 2: Evolve controller with CMA-ES on the selected body
     console.rule("Stage 2: Controller Evolution (CMA-ES)")
     console.log({"algorithm": "CMA-ES", "duration": "30s", "budget": 400})
-    
-    best_f, best_theta = _probe_body_with_cma(genotype, 0, duration=30.0, budget=400)
+    best_f, best_theta = _probe_body_with_cma(nde_genotype, 0, duration=60.0, budget=400)
     console.log({"training_complete": True, "final_distance": f"{-best_f:.3f}m forward"})
     
     # Save results
@@ -629,7 +692,10 @@ def main() -> None:
         console.log({"best_distance": f"{-best_f:.3f}m forward", "launching_viewer": True})
         
         # Rebuild best robot from genotype (completely fresh for viewer)
-        best_core = _build_simple_robot_from_genotype(genotype)
+        best_core = _nde_generate_core(nde_genotype[0], nde_genotype[1], nde_genotype[2], max_modules=12)
+        if best_core is None:
+            console.log({"viewer_error": "nde_rebuild_failed"})
+            return
         
         # Create fresh world and spawn
         mj.set_mjcb_control(None)  # Clear any previous controller
