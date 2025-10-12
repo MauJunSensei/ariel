@@ -64,7 +64,7 @@ DEFAULT_PARALLEL: Final[bool] = True
 #   "no_control"- launch with no control callback set
 #   "frame"     - render a single debug frame
 # Choose the default mode for experiments here.
-DEFAULT_SIM_MODE: Final[str] = "video"
+DEFAULT_SIM_MODE: Final[str] = "simple"
 
 # DEFAULT_MAX_WORKERS: maximum number of worker processes to use when parallel=True.
 # If None, the ProcessPoolExecutor will choose a sensible default (usually os.cpu_count()).
