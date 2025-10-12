@@ -19,8 +19,6 @@ from ariel.body_phenotypes.robogen_lite.constructor import (
 )
 from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
     HighProbabilityDecoder,
-    save_graph_as_json,
-    draw_graph,
 )
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
 from ariel.simulation.controllers.controller import Controller
@@ -30,6 +28,7 @@ from ariel.utils.runners import simple_runner
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
+import nevergrad as ng
 
 # Type Checking
 if TYPE_CHECKING:
@@ -53,12 +52,15 @@ from config import (
     TOURNAMENT_SIZE,
     PARALLEL_EVAL,
     ELITISM_K,
-    FIT_W_FORWARD,
-    FIT_W_LATERAL,
-    FIT_W_BOUNCE,
-    FIT_W_SMOOTH,
-    FIT_SECTION_THRESHOLDS,
-    FIT_SECTION_BONUSES,
+    TRAIN_CONTROLLER,
+    TRAIN_BUDGET,
+    TRAIN_DURATION,
+    TRAIN_ALGO,
+    VIABILITY_CHECK,
+    VIABILITY_DURATION,
+    VIABILITY_MIN_DISPLACEMENT,
+    VIABILITY_MAX_ATTEMPTS,
+    
 )
 
 # Type Aliases
@@ -89,9 +91,174 @@ class Individual:
         self.body_genes: list[np.ndarray] = body_genes
         self.graph: DiGraph[Any] | None = None
         self.controller: Controller = controller
-        self.fitness: float | None = None
+        self.fitness: float = -np.inf
         # Optional controller weights included in genotype; initialized lazily when model dims are known
         self.controller_weights: dict[str, np.ndarray] | None = controller_weights
+
+# ------------------------------
+# Controller weight utils and trainer
+# ------------------------------
+def _weight_shapes_for_model(model: mj.MjModel) -> dict[str, tuple[int, int]]:
+    """Expected weight shapes for the simple NN controller for a given MuJoCo model."""
+    input_size = model.nq  # same as len(data.qpos)
+    hidden = CONTROLLER_HIDDEN_SIZE
+    output = model.nu
+    return {
+        "w1": (input_size, hidden),
+        "w2": (hidden, hidden),
+        "w3": (hidden, output),
+    }
+
+
+def _flatten_weights(weights: dict[str, np.ndarray], shapes: dict[str, tuple[int, int]]) -> np.ndarray:
+    parts: list[np.ndarray] = []
+    for k in ("w1", "w2", "w3"):
+        r, c = shapes[k]
+        w = weights.get(k)
+        if w is None or w.shape != (r, c):
+            parts.append(np.zeros((r, c)).ravel())
+        else:
+            parts.append(w.ravel())
+    return np.concatenate(parts, dtype=float)
+
+
+def _unflatten_weights(vec: np.ndarray, shapes: dict[str, tuple[int, int]]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    idx = 0
+    for k in ("w1", "w2", "w3"):
+        r, c = shapes[k]
+        size = r * c
+        part = vec[idx: idx + size]
+        if part.size != size:
+            part = np.zeros(size)
+        out[k] = np.asarray(part, dtype=float).reshape((r, c))
+        idx += size
+    return out
+
+
+def _train_controller_for_body(
+    robot: Any,
+    controller: Controller,
+    *,
+    duration: float,
+    budget: int,
+    algo: str = "cma",
+    init_weights: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    """Train controller weights for the given robot using Nevergrad.
+
+    Runs short rollouts of length `duration` inside the OlympicArena to maximize
+    displacement along +X. Returns the best-found weight dictionary.
+    """
+    # Isolate callbacks
+    mj.set_mjcb_control(None)
+
+    # Build environment model once
+    world = OlympicArena(load_precompiled=False)
+    world.spawn(robot.spec, position=SPAWN_POS, correct_collision_with_floor=True)
+    model = world.spec.compile()
+    shapes = _weight_shapes_for_model(model)
+
+    # Initial vector
+    if init_weights is None:
+        rng = np.random.default_rng(123)
+        init_weights = {
+            "w1": rng.normal(0, 0.5, size=shapes["w1"]),
+            "w2": rng.normal(0, 0.5, size=shapes["w2"]),
+            "w3": rng.normal(0, 0.5, size=shapes["w3"]),
+        }
+    x0 = _flatten_weights(init_weights, shapes)
+
+    # Parameterization with bounds
+    lower = np.full_like(x0, -3.0, dtype=float)
+    upper = np.full_like(x0, 3.0, dtype=float)
+    parametrization = ng.p.Array(init=x0).set_bounds(lower, upper)
+
+    if algo.lower() == "cma":
+        optimizer: ng.optimization.base.Optimizer = ng.optimizers.CMA(parametrization=parametrization, budget=budget)
+    else:
+        optimizer = ng.optimizers.TBPSA(parametrization=parametrization, budget=budget)
+
+    def objective(xvec: np.ndarray) -> float:
+        # Unpack weights
+        weights = _unflatten_weights(np.asarray(xvec, dtype=float), shapes)
+        # Fresh data and reset
+        data = mj.MjData(model)
+        mj.mj_resetData(model, data)
+        # Reset and setup tracker
+        controller.tracker.reset()
+        controller.tracker.setup(world.spec, data)
+        # Control callback
+        def _cb(m: mj.MjModel, d: mj.MjData) -> None:
+            controller.set_control(m, d, weights=weights)
+        mj.set_mjcb_control(_cb)
+        # Short rollout
+        simple_runner(model, data, duration=duration)
+        # Score
+        hist = controller.tracker.history.get("xpos", {}).get(0, [])
+        fit = fitness_function(hist)
+        return -float(fit if np.isfinite(fit) else -1e9)
+
+    rec = optimizer.minimize(objective)
+    best_vec = np.asarray(rec.value, dtype=float)
+    return _unflatten_weights(best_vec, shapes)
+
+def _uniform_mix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Elementwise uniform crossover between two arrays of the same shape."""
+    if a.shape != b.shape:
+        return a.copy()
+    mask = RNG.random(a.shape) < 0.5
+    out = a.copy()
+    out[~mask] = b[~mask]
+    return out
+
+def crossover(parent_a: Individual, parent_b: Individual) -> Individual:
+    """Create a child by uniform crossover of body genes and controller weights.
+
+    The child's body graph is generated; validity is checked by attempting to
+    construct the MuJoCo spec. Caller may still apply mutation and validation.
+    """
+    child = Individual(body_genes=[], controller=generate_controller(), controller_weights=None)
+    # Body genes (3 arrays)
+    for ga, gb in zip(parent_a.body_genes, parent_b.body_genes):
+        child.body_genes.append(_uniform_mix(ga, gb))
+
+    # Controller weights (optional)
+    if parent_a.controller_weights is not None or parent_b.controller_weights is not None:
+        child.controller_weights = {}
+        keys: set[str] = set()
+        if parent_a.controller_weights is not None:
+            keys.update(parent_a.controller_weights.keys())
+        if parent_b.controller_weights is not None:
+            keys.update(parent_b.controller_weights.keys())
+        for k in keys:
+            wa = parent_a.controller_weights.get(k) if parent_a.controller_weights else None
+            wb = parent_b.controller_weights.get(k) if parent_b.controller_weights else None
+            if wa is None and wb is not None:
+                child.controller_weights[k] = wb.copy()
+            elif wb is None and wa is not None:
+                child.controller_weights[k] = wa.copy()
+            elif wa is None and wb is None:
+                # nothing to inherit for this key
+                continue
+            else:
+                child.controller_weights[k] = _uniform_mix(wa, wb)
+
+    # Build graph from genes
+    generate_body(child, child.body_genes)
+    return child
+
+def _is_valid_body(ind: Individual) -> bool:
+    """Validate that individual's body can be constructed into a MuJoCo model."""
+    try:
+        if ind.graph is None:
+            return False
+        robot = construct_mjspec_from_graph(ind.graph)
+        _model = robot.spec.compile()
+        return True
+    except Exception as e:
+        console.log(f"Invalid body during validation: {e}")
+        return False
 
 def generate_body_genes():
     # Generate random body genes
@@ -126,59 +293,70 @@ def generate_body(ind: Individual, genes: list[np.ndarray] | None = None) -> Non
     )
 
 
-def fitness_function(history: list[tuple[float, float, float]]) -> float:
-    """Richer fitness for Olympic track: reward forward progress and robustness.
+def _quick_viability(robot: Any, duration: float, min_dx: float) -> bool:
+    """Fast headless rollout with a naive controller to test if body can move.
 
-    Components:
-    - Forward progress: max x achieved (normalized by expected track length ~5m)
-    - Lateral penalty: average absolute y (stay near center line)
-    - Bounce penalty: average absolute dz per step (discourage hopping)
-    - Smoothness: average absolute second derivative of x (jerk)
-    - Section bonuses: add bonuses when passing X thresholds
+    Uses a small sine-wave actuation across all DOFs to induce motion and
+    checks the forward displacement along +X. Returns True if displacement
+    exceeds min_dx.
+    """
+    try:
+        world = OlympicArena(load_precompiled=False)
+        world.spawn(robot.spec, position=SPAWN_POS, correct_collision_with_floor=True)
+        model = world.spec.compile()
+        data = mj.MjData(model)
+        mj.mj_resetData(model, data)
+
+        # Simple sine controller inline (avoid using Controller for speed)
+        t = 0.0
+        dt = model.opt.timestep
+        steps_per = 50
+        tracker = Tracker(mujoco_obj_to_find=mj.mjtObj.mjOBJ_BODY, name_to_bind="core")
+        tracker.setup(world.spec, data)
+
+        while data.time < duration:
+            if model.nu > 0:
+                freq = 1.5
+                amps = 0.8
+                data.ctrl[:] = amps * np.sin(2 * np.pi * freq * t)
+            mj.mj_step(model, data, nstep=steps_per)
+            tracker.update(data)
+            t += dt * steps_per
+
+        hist = tracker.history.get("xpos", {}).get(0, [])
+        fit = fitness_function(hist)
+        return bool(np.isfinite(fit) and fit >= min_dx)
+    except Exception:
+        return False
+
+
+def fitness_function(history: list[tuple[float, float, float]]) -> float:
+    """Fitness: forward displacement along +X (x_last - x_first).
+
+    Mirrors the displacement-based scoring used in `A3_clean.py`'s
+    quick viability / controller-training objectives.
     """
     if not history:
         return -1e6
 
-    pos = np.array(history)  # shape (T, 3)
+    pos = np.array(history)
+    if pos.size == 0 or pos.ndim != 2 or pos.shape[1] < 1:
+        return -1e6
+
     x = pos[:, 0]
-    y = pos[:, 1]
-    z = pos[:, 2]
+    # Displacement from start to finish
+    try:
+        displacement = float(x[-1] - x[0])
+    except Exception:
+        return -1e6
 
-    # Forward progress (clamped 0..1 by dividing by approximate course length)
-    course_len = max(FIT_SECTION_THRESHOLDS[-1], 1.0)
-    fwd = np.clip(np.max(x) / course_len, 0.0, 1.0)
+    if not np.isfinite(displacement):
+        return -1e6
 
-    # Lateral deviation (lower is better)
-    lateral = float(np.mean(np.abs(y))) if y.size > 0 else 0.0
-
-    # Vertical bounce proxy: mean |dz| per time step
-    dz = np.diff(z) if z.size > 1 else np.array([0.0])
-    bounce = float(np.mean(np.abs(dz)))
-
-    # Smoothness in forward motion: mean |d2x|
-    dx = np.diff(x) if x.size > 1 else np.array([0.0])
-    ddx = np.diff(dx) if dx.size > 1 else np.array([0.0])
-    smooth = float(np.mean(np.abs(ddx)))
-
-    # Section bonuses
-    bonus = 0.0
-    xmax = float(np.max(x))
-    for thr, b in zip(FIT_SECTION_THRESHOLDS, FIT_SECTION_BONUSES):
-        if xmax >= thr:
-            bonus += b
-
-    # Combine; penalties subtract from reward
-    score = (
-        FIT_W_FORWARD * fwd
-        - FIT_W_LATERAL * lateral
-        - FIT_W_BOUNCE * bounce
-        - FIT_W_SMOOTH * smooth
-        + bonus
-    )
-    return float(score)
+    return displacement
 
 
-def show_xpos_history(history: list[float]) -> None:
+def show_xpos_history(history: list[float], save_path: Path | str | None = None) -> None:
     # Create a tracking camera
     camera = mj.MjvCamera()
     camera.type = mj.mjtCamera.mjCAMERA_FREE
@@ -239,8 +417,11 @@ def show_xpos_history(history: list[float]) -> None:
     # Title
     plt.title("Robot Path in XY Plane")
 
-    # Show results
-    plt.show()
+    # Save or show results
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+    else:
+        plt.show()
 
 
 def nn_controller(
@@ -390,6 +571,21 @@ def evaluate(individual: Individual) -> float:
         generate_body(individual)
     robot = construct_mjspec_from_graph(individual.graph)
 
+    # Optionally train controller for this body before full evaluation
+    if TRAIN_CONTROLLER:
+        try:
+            trained = _train_controller_for_body(
+                robot,
+                individual.controller,
+                duration=TRAIN_DURATION,
+                budget=TRAIN_BUDGET,
+                algo=TRAIN_ALGO,
+                init_weights=individual.controller_weights,
+            )
+            individual.controller_weights = trained
+        except Exception as e:
+            console.log(f"Controller training failed: {e}")
+
     # Run the experiment
     experiment(
         robot=robot,
@@ -411,13 +607,13 @@ def evaluate(individual: Individual) -> float:
 
 def select_survivors(population: list[Individual], num_survivors: int) -> list[Individual]:
     """Tournament selection with elitism and unique winners in a generation."""
-    valid = [ind for ind in population if ind.fitness is not None]
+    valid = [ind for ind in population]
     if not valid:
         raise ValueError("No individuals with valid fitness to select from.")
 
     # Typed helper for fitness access to satisfy type checkers
     def _fitness_of(ind: "Individual") -> float:
-        return float(ind.fitness) if ind.fitness is not None else -1e9
+        return float(ind.fitness)
 
     ranked = sorted(valid, key=_fitness_of, reverse=True)
     elites = ranked[:min(ELITISM_K, num_survivors)]
@@ -434,21 +630,101 @@ def select_survivors(population: list[Individual], num_survivors: int) -> list[I
 
     return survivors
 
+def _evaluate_worker(payload: tuple[list[np.ndarray], dict[str, np.ndarray] | None]) -> tuple[float, dict[str, np.ndarray] | None]:
+    """Worker function executed in a separate process.
+
+    Accepts a picklable payload (body_genes, controller_weights). Reconstructs
+    an Individual, builds its body, runs a headless evaluation and returns
+    the fitness and any resulting controller weights. This avoids pickling
+    non-serializable objects like Controller/Tracker/MuJoCo objects.
+    """
+    body_genes, controller_weights = payload
+
+    # Reconstruct a minimal Individual inside the worker
+    try:
+        ind = Individual(
+            body_genes=[g.copy() for g in body_genes],
+            controller=generate_controller(),
+            controller_weights=None,
+        )
+        # Build body graph and compile robot spec
+        generate_body(ind, genes=ind.body_genes)
+        robot = construct_mjspec_from_graph(ind.graph)
+    except Exception:
+        # Invalid body or build failure -> very low fitness
+        return (-1e9, None)
+
+    # Optionally train controller in the worker
+    try:
+        if TRAIN_CONTROLLER:
+            trained = _train_controller_for_body(
+                robot,
+                ind.controller,
+                duration=TRAIN_DURATION,
+                budget=TRAIN_BUDGET,
+                algo=TRAIN_ALGO,
+                init_weights=controller_weights,
+            )
+            controller_weights = trained
+    except Exception:
+        pass
+
+    # Run the experiment headless (use "simple" mode for speed)
+    try:
+        experiment(
+            robot=robot,
+            controller=ind.controller,
+            duration=RUN_DURATION,
+            mode="simple",
+            controller_weights=controller_weights,
+        )
+
+        resulting_weights = getattr(ind.controller, "weights", None)
+        fitness = fitness_function(ind.controller.tracker.history["xpos"][0])
+        return (float(fitness), {k: v.copy() for k, v in resulting_weights.items()} if resulting_weights is not None else None)
+    except Exception:
+        return (-1e9, None)
+
+
 def evaluate_all(population: list[Individual]) -> None:
-    """Evaluate all individuals, optionally in parallel when PARALLEL_EVAL is True."""
-    if not PARALLEL_EVAL:
-        for ind in population:
-            ind.fitness = evaluate(ind)
+    """Evaluate all individuals, optionally in parallel when PARALLEL_EVAL is True.
+
+    Uses a top-level worker that accepts only picklable data (body_genes,
+    controller_weights) so it is safe with ProcessPoolExecutor.
+
+    IMPORTANT: skip individuals that already have a finite fitness so that
+    elitism (carrying over best individuals without re-evaluation) works.
+    """
+    # Determine which indices actually need evaluation
+    to_eval_idxs = [i for i, ind in enumerate(population) if not np.isfinite(ind.fitness)]
+    if not to_eval_idxs:
         return
 
+    if not PARALLEL_EVAL:
+        for i in to_eval_idxs:
+            population[i].fitness = evaluate(population[i])
+        return
+
+    # Prepare serializable tasks only for individuals that need evaluation
+    tasks: list[tuple[int, list[np.ndarray], dict[str, np.ndarray] | None]] = [
+        (i, [g.copy() for g in population[i].body_genes], population[i].controller_weights)
+        for i in to_eval_idxs
+    ]
+
+    # Map futures -> original population index
     with ProcessPoolExecutor() as ex:
-        futures = {ex.submit(evaluate, ind): ind for ind in population}
+        futures = {ex.submit(_evaluate_worker, (body_genes, controller_weights)): idx for (idx, body_genes, controller_weights) in tasks}
         for future in as_completed(futures):
-            ind = futures[future]
+            orig_idx = futures[future]
+            ind = population[orig_idx]
             try:
-                ind.fitness = future.result()
+                fit, weights = future.result()
+                ind.fitness = fit
+                # If worker returned trained weights and main process had none, store them
+                if ind.controller_weights is None and weights is not None:
+                    ind.controller_weights = weights
             except Exception as e:
-                console.log(f"Evaluation failed: {e}")
+                console.log(f"Evaluation failed for individual {orig_idx}: {e}")
                 ind.fitness = -1e9
 
 def mutate(individual: Individual) -> None:
@@ -475,7 +751,7 @@ def mutate(individual: Individual) -> None:
                 noise_w = RNG.normal(loc=0.0, scale=0.1, size=w2.shape).astype(w2.dtype)
                 w2[mask_w] = w2[mask_w] + noise_w[mask_w]
             individual.controller_weights[k] = w2
-    individual.fitness = None
+    individual.fitness = -np.inf
     
 
 def main() -> None:
@@ -484,16 +760,21 @@ def main() -> None:
     # Initialize the population
     
     # Store population as list of (graph, controller) tuples with precise typing
-    population: list[Individual] = [
-        Individual(
+    population: list[Individual] = []
+    attempts = 0
+    while len(population) < POPULATION_SIZE and attempts < (POPULATION_SIZE * max(1, VIABILITY_MAX_ATTEMPTS)):
+        attempts += 1
+        ind = Individual(
             body_genes=generate_body_genes(),
             controller=generate_controller(),
             controller_weights=None,
-        ) for _ in range(POPULATION_SIZE)
-    ]
-
-    for ind in population:
+        )
         generate_body(ind)
+        if not _is_valid_body(ind):
+            continue
+        robot = construct_mjspec_from_graph(ind.graph)
+        if not VIABILITY_CHECK or _quick_viability(robot, duration=VIABILITY_DURATION, min_dx=VIABILITY_MIN_DISPLACEMENT):
+            population.append(ind)
 
     if len(population) == 0:
         raise ValueError("Population is empty.")
@@ -503,66 +784,92 @@ def main() -> None:
     # ? ------------------------------------------------------------------ #
     # Evolutionary loop
 
+    fitness_history: list[list[float]] = []
+
     for gen in range(GENERATIONS):
         console.log(f"Generation {gen + 1}/{GENERATIONS}, Population size: {len(population)}")
-        if gen > 0:
-            fitness_vals = [ind.fitness for ind in population if ind.fitness is not None]
-            if fitness_vals:
-                console.log(f"Current best fitness: {max(fitness_vals)}")
 
         evaluate_all(population)
-        for ind in population:
-            console.log(f"Individual fitness: {ind.fitness}")
+
+        fitness_vals = [ind.fitness for ind in population]
+        if fitness_vals:
+            console.log(f"Current best fitness: {max(fitness_vals)}")
+            console.log(f"Current average fitness: {sum(fitness_vals) / len(fitness_vals)}")
 
         survivors = select_survivors(population, num_survivors=POPULATION_SIZE // 2)
         offspring: list[Individual] = []
 
-        for ind in survivors:
-            child = Individual(
-                body_genes=[],
-                controller=generate_controller(),
-                controller_weights=None,
-            )
-            # Deep-copy body genes and build graph in-place
-            child.body_genes = [arr.copy() for arr in ind.body_genes]
-            generate_body(child, child.body_genes)
-            # Inherit controller weights (mutated later) but not the controller instance
-            if ind.controller_weights is not None:
-                child.controller_weights = {k: v.copy() for k, v in ind.controller_weights.items()}
+        # Generate offspring using crossover + mutation with validity check
+        while len(offspring) < POPULATION_SIZE - len(survivors):
+            # Randomly choose two parents from survivors (sample indices for type safety)
+            idxs = RNG.choice(len(survivors), size=2, replace=True)
+            pa, pb = survivors[int(idxs[0])], survivors[int(idxs[1])]
+            child = crossover(pa, pb)
+            # Mutate child
             mutate(child)
-            offspring.append(child)
+            # Rebuild and validate body
+            generate_body(child, child.body_genes)
+            if _is_valid_body(child):
+                offspring.append(child)
+            else:
+                # Fallback: choose fitter parent clone and slight mutate
+                base = pa if pa.fitness >= pb.fitness else pb
+                clone = Individual(
+                    body_genes=[arr.copy() for arr in base.body_genes],
+                    controller=generate_controller(),
+                    controller_weights=(
+                        {k: v.copy() for k, v in base.controller_weights.items()} if base.controller_weights else None
+                    ),
+                )
+                generate_body(clone, clone.body_genes)
+                mutate(clone)
+                if _is_valid_body(clone):
+                    offspring.append(clone)
         
         console.log(f"Selected {len(survivors)} survivors, generated {len(offspring)} offspring.")
+        fitness_history.append([ind.fitness for ind in population])
 
         population = survivors + offspring
 
+    # Plot average and best fitness over generations
+    if fitness_history:
+        arr = np.array(fitness_history, dtype=np.float64)
+        # Replace non-finite values with NaN so nan-aware reductions work
+        arr = np.where(np.isfinite(arr), arr, np.nan)
+
+        avg_fitness = np.nanmean(arr, axis=1)
+        best_fitness = np.nanmax(arr, axis=1)
+
+        generations = np.arange(1, len(avg_fitness) + 1)
+
+        plt.figure(figsize=(8, 4.5))
+        plt.plot(generations, avg_fitness, label="Average fitness", linewidth=2)
+        plt.plot(generations, best_fitness, label="Best fitness", linewidth=2)
+        plt.xlabel("Generation")
+        plt.ylabel("Fitness")
+        plt.title("Average and Best Fitness Over Generations")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+
+        out_path = DATA / "fitness_over_time.png"
+        plt.savefig(str(out_path), dpi=200)
+        console.log(f"Saved fitness plot to: {out_path}")
+    else:
+        console.log("No fitness history available to plot.")
+
     # ------------------------------------------------------------------ #
     # After evolution: find best individual and save its graph + visualization
-    best = None
-    best_fit = -1e12
-    for ind in population:
-        if ind.fitness is not None and ind.fitness > best_fit:
-            best = ind
-            best_fit = ind.fitness
+    # best: Individual = population[0]
+    # for ind in population:
+    #     if ind.fitness > best.fitness:
+    #         best = ind
 
-    if best is not None and best.graph is not None:
-        DATA.mkdir(exist_ok=True)
-        json_path = DATA / "best_robot_graph.json"
-        png_path = DATA / "best_robot_graph.png"
-        try:
-            save_graph_as_json(best.graph, save_file=json_path)
-            draw_graph(best.graph, title=f"Best graph (fit={best_fit:.3f})", save_file=png_path)
-            console.log(f"Saved best graph JSON to {json_path} and image to {png_path}")
-        except Exception as e:
-            console.log(f"Failed to save best graph: {e}")
-    else:
-        console.log("No best individual with a graph found to save.")
+    # # ? ------------------------------------------------------------------ #
+    # # Print all nodes
+    # core = construct_mjspec_from_graph(best.graph) # type: ignore
 
-    # ? ------------------------------------------------------------------ #
-    # Print all nodes
-    # core = construct_mjspec_from_graph(robot_graph)
-
-    # ? ------------------------------------------------------------------ #
+    # # ? ------------------------------------------------------------------ #
     # mujoco_type_to_find = mj.mjtObj.mjOBJ_GEOM
     # name_to_bind = "core"
     # tracker = Tracker(
@@ -570,8 +877,8 @@ def main() -> None:
     #     name_to_bind=name_to_bind,
     # )
 
-    # ? ------------------------------------------------------------------ #
-    # Simulate the robot
+    # # ? ------------------------------------------------------------------ #
+    # # Simulate the robot
     # ctrl = Controller(
     #     controller_callback_function=nn_controller,
     #     # controller_callback_function=random_move,
@@ -585,6 +892,11 @@ def main() -> None:
     # fitness = fitness_function(tracker.history["xpos"][0])
     # msg = f"Fitness of generated robot: {fitness}"
     # console.log(msg)
+
+    # save_graph_as_json(
+    #     best.graph,
+    #     DATA / "robot_graph.json",
+    # )
 
 
 if __name__ == "__main__":
