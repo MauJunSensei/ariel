@@ -19,16 +19,24 @@ from ariel.body_phenotypes.robogen_lite.constructor import (
 )
 from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
     HighProbabilityDecoder,
+    save_graph_as_json,
 )
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
 from ariel.simulation.controllers.controller import Controller
 from ariel.simulation.environments import OlympicArena
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from ariel.utils.tracker import Tracker
 from ariel.utils.video_recorder import VideoRecorder
 import nevergrad as ng
+try:
+    from tqdm import tqdm
+    tqdm_ctor = tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
+    tqdm_ctor = None
 
 # Type Checking
 if TYPE_CHECKING:
@@ -256,8 +264,7 @@ def _is_valid_body(ind: Individual) -> bool:
         robot = construct_mjspec_from_graph(ind.graph)
         _model = robot.spec.compile()
         return True
-    except Exception as e:
-        console.log(f"Invalid body during validation: {e}")
+    except Exception:
         return False
 
 def generate_body_genes():
@@ -524,43 +531,47 @@ def experiment(
     )
 
     # ------------------------------------------------------------------ #
-    match mode:
-        case "simple":
-            # This disables visualisation (fastest option)
-            simple_runner(
-                model,
-                data,
-                duration=duration,
-            )
-        case "frame":
-            # Render a single frame (for debugging)
-            save_path = str(DATA / "robot.png")
-            single_frame_renderer(model, data, save=True, save_path=save_path)
-        case "video":
-            # This records a video of the simulation
-            path_to_video_folder = str(DATA / "videos")
-            video_recorder = VideoRecorder(output_folder=path_to_video_folder)
+    try:
+        match mode:
+            case "simple":
+                # This disables visualisation (fastest option)
+                simple_runner(
+                    model,
+                    data,
+                    duration=duration,
+                )
+            case "frame":
+                # Render a single frame (for debugging)
+                save_path = str(DATA / "robot.png")
+                single_frame_renderer(model, data, save=True, save_path=save_path)
+            case "video":
+                # This records a video of the simulation
+                path_to_video_folder = str(DATA / "videos")
+                video_recorder = VideoRecorder(output_folder=path_to_video_folder)
 
-            # Render with video recorder
-            video_renderer(
-                model,
-                data,
-                duration=duration,
-                video_recorder=video_recorder,
-            )
-        case "launcher":
-            # This opens a liver viewer of the simulation
-            viewer.launch(
-                model=model,
-                data=data,
-            )
-        case "no_control":
-            # If mj.set_mjcb_control(None), you can control the limbs manually.
-            mj.set_mjcb_control(None)
-            viewer.launch(
-                model=model,
-                data=data,
-            )
+                # Render with video recorder
+                video_renderer(
+                    model,
+                    data,
+                    duration=duration,
+                    video_recorder=video_recorder,
+                )
+            case "launcher":
+                # This opens a liver viewer of the simulation
+                viewer.launch(
+                    model=model,
+                    data=data,
+                )
+            case "no_control":
+                # If mj.set_mjcb_control(None), you can control the limbs manually.
+                mj.set_mjcb_control(None)
+                viewer.launch(
+                    model=model,
+                    data=data,
+                )
+    finally:
+        # Always clear callback to avoid leaking to subsequent runs/validations
+        mj.set_mjcb_control(None)
     # ==================================================================== #
 
 def evaluate(individual: Individual) -> float:
@@ -686,6 +697,23 @@ def _evaluate_worker(payload: tuple[list[np.ndarray], dict[str, np.ndarray] | No
         return (-1e9, None)
 
 
+def _init_worker() -> list[np.ndarray] | None:
+    """Lightweight worker to generate random body genes only.
+
+    Uses a local RNG to avoid correlation across tasks. Avoids any heavy MuJoCo/
+    SciPy imports or compilation in worker threads/processes.
+    Returns a list of three numpy arrays on success, else None.
+    """
+    try:
+        local_rng = np.random.default_rng()
+        type_p_genes = local_rng.uniform(-100, 100, GENOTYPE_SIZE).astype(np.float32)
+        conn_p_genes = local_rng.uniform(-100, 100, GENOTYPE_SIZE).astype(np.float32)
+        rot_p_genes = local_rng.uniform(-100, 100, GENOTYPE_SIZE).astype(np.float32)
+        return [type_p_genes, conn_p_genes, rot_p_genes]
+    except Exception:
+        return None
+
+
 def evaluate_all(population: list[Individual]) -> None:
     """Evaluate all individuals, optionally in parallel when PARALLEL_EVAL is True.
 
@@ -759,32 +787,64 @@ def main() -> None:
     # ? ------------------------------------------------------------------ #
     # Initialize the population
     
-    # Store population as list of (graph, controller) tuples with precise typing
+    # Store population as list of Individuals. Initialize using a lightweight thread pool to avoid Windows spawn overheads.
     population: list[Individual] = []
+    max_attempts = POPULATION_SIZE * max(1, VIABILITY_MAX_ATTEMPTS)
     attempts = 0
-    while len(population) < POPULATION_SIZE and attempts < (POPULATION_SIZE * max(1, VIABILITY_MAX_ATTEMPTS)):
-        attempts += 1
-        ind = Individual(
-            body_genes=generate_body_genes(),
-            controller=generate_controller(),
-            controller_weights=None,
-        )
-        generate_body(ind)
-        if not _is_valid_body(ind):
-            continue
-        robot = construct_mjspec_from_graph(ind.graph)
-        if not VIABILITY_CHECK or _quick_viability(robot, duration=VIABILITY_DURATION, min_dx=VIABILITY_MIN_DISPLACEMENT):
-            population.append(ind)
+    use_tqdm = tqdm is not None
+    total_display = max_attempts if max_attempts > 0 else None
+    pbar = tqdm_ctor(total=total_display, desc="init attempts", unit="att") if use_tqdm and tqdm_ctor is not None else None
+
+    # Limit number of concurrent gene generators
+    max_workers = min(8, os.cpu_count() or 2)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # Seed initial submissions
+        inflight = {ex.submit(_init_worker) for _ in range(max_workers)}
+        while len(population) < POPULATION_SIZE and attempts < max_attempts and inflight:
+            for fut in as_completed(list(inflight)):
+                attempts += 1
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(collected=f"{len(population)}/{POPULATION_SIZE}")
+                inflight.remove(fut)
+                try:
+                    genes = fut.result()
+                except Exception:
+                    genes = None
+
+                if genes is not None:
+                    # Build and validate in main thread to avoid heavy imports in workers
+                    ind = Individual(body_genes=[g.copy() for g in genes], controller=generate_controller(), controller_weights=None)
+                    generate_body(ind)
+                    if _is_valid_body(ind):
+                        # Optional viability check
+                        if not VIABILITY_CHECK:
+                            population.append(ind)
+                        else:
+                            try:
+                                robot = construct_mjspec_from_graph(ind.graph)
+                                if _quick_viability(robot, duration=VIABILITY_DURATION, min_dx=VIABILITY_MIN_DISPLACEMENT):
+                                    population.append(ind)
+                            except Exception:
+                                pass
+
+                # Replenish submissions if we still need more
+                if len(population) < POPULATION_SIZE and attempts < max_attempts:
+                    inflight.add(ex.submit(_init_worker))
+
+    if pbar is not None:
+        pbar.close()
 
     if len(population) == 0:
         raise ValueError("Population is empty.")
-    else:
-        console.log(f"Initialized population with {len(population)} individuals.")
+    console.log(f"Initialized population with {len(population)} individuals.")
     
     # ? ------------------------------------------------------------------ #
     # Evolutionary loop
 
-    fitness_history: list[list[float]] = []
+    # Memory-efficient fitness summary: store only per-generation average and best
+    avg_fitness_history: list[float] = []
+    best_fitness_history: list[float] = []
 
     for gen in range(GENERATIONS):
         console.log(f"Generation {gen + 1}/{GENERATIONS}, Population size: {len(population)}")
@@ -792,9 +852,74 @@ def main() -> None:
         evaluate_all(population)
 
         fitness_vals = [ind.fitness for ind in population]
-        if fitness_vals:
-            console.log(f"Current best fitness: {max(fitness_vals)}")
-            console.log(f"Current average fitness: {sum(fitness_vals) / len(fitness_vals)}")
+
+        # Best (allow -inf if all are invalid) and average (ignore non-finite entries)
+        best = max(fitness_vals) if fitness_vals else float("nan")
+        finite_vals = [f for f in fitness_vals if np.isfinite(f)]
+        avg = float(np.mean(finite_vals)) if finite_vals else float("nan")
+
+        console.log(f"Current best fitness: {best}")
+        console.log(f"Current average fitness: {avg if not np.isnan(avg) else 'N/A'}")
+
+        # --- Save artifacts (graph, weights) and a video of the best individual ---
+        try:
+            # Find the best individual (skip if population empty)
+            if population:
+                best_ind = max(population, key=lambda ind: ind.fitness)
+            else:
+                best_ind = None
+        except Exception:
+            best_ind = None
+
+        if best_ind is not None and np.isfinite(best_ind.fitness):
+            try:
+                # Ensure graph exists and is buildable
+                if best_ind.graph is None:
+                    generate_body(best_ind)
+
+                # Save graph JSON and controller weights for this generation
+                try:
+                    art_dir = DATA / "artifacts"
+                    art_dir.mkdir(exist_ok=True)
+                    graph_path = art_dir / f"gen_{gen+1:03d}_best_graph.json"
+                    save_graph_as_json(best_ind.graph, graph_path)
+
+                    # Prefer explicitly stored weights; fallback to controller.weights if present
+                    weights = best_ind.controller_weights if best_ind.controller_weights is not None else getattr(best_ind.controller, "weights", None)
+                    if isinstance(weights, dict) and weights:
+                        weights_path = art_dir / f"gen_{gen+1:03d}_controller_weights.npz"
+                        # Ensure numpy arrays and save compressed
+                        np.savez_compressed(
+                            str(weights_path),
+                            **{k: np.asarray(v) for k, v in weights.items() if isinstance(v, np.ndarray)},
+                        )
+                except Exception as e:
+                    console.log(f"Failed to save artifacts for generation {gen+1}: {e}")
+
+                if _is_valid_body(best_ind):
+                    try:
+                        robot = construct_mjspec_from_graph(best_ind.graph)
+                    except Exception as e:
+                        console.log(f"Skipping video: failed to construct robot for generation {gen+1}: {e}")
+                    else:
+                        # Use a fresh controller and supply any learned weights
+                        vid_ctrl = generate_controller()
+                        try:
+                            experiment(
+                                robot=robot,
+                                controller=vid_ctrl,
+                                duration=RUN_DURATION,
+                                mode="video",
+                                controller_weights=best_ind.controller_weights,
+                            )
+                            console.log(f"Saved video for generation {gen+1} (fitness={best_ind.fitness}) to: {DATA / 'videos'}")
+                        except Exception as e:
+                            # Rendering or engine issues should not stop the run
+                            console.log(f"Failed to render/save video for generation {gen+1}: {e}")
+                else:
+                    console.log(f"Best individual invalid in generation {gen+1}; skipping video.")
+            except Exception as e:
+                console.log(f"Unexpected error while attempting to save video for generation {gen+1}: {e}")
 
         survivors = select_survivors(population, num_survivors=POPULATION_SIZE // 2)
         offspring: list[Individual] = []
@@ -825,26 +950,59 @@ def main() -> None:
                 mutate(clone)
                 if _is_valid_body(clone):
                     offspring.append(clone)
-        
-        console.log(f"Selected {len(survivors)} survivors, generated {len(offspring)} offspring.")
-        fitness_history.append([ind.fitness for ind in population])
 
+        console.log(f"Selected {len(survivors)} survivors, generated {len(offspring)} offspring.")
+
+        # Append only summaries to keep memory down
+        avg_fitness_history.append(avg)
+        best_fitness_history.append(best)
+
+        # Keep population for next generation
         population = survivors + offspring
 
-    # Plot average and best fitness over generations
-    if fitness_history:
-        arr = np.array(fitness_history, dtype=np.float64)
-        # Replace non-finite values with NaN so nan-aware reductions work
-        arr = np.where(np.isfinite(arr), arr, np.nan)
 
-        avg_fitness = np.nanmean(arr, axis=1)
-        best_fitness = np.nanmax(arr, axis=1)
+    # Plot average and best fitness over generations using memory-efficient summaries
+    # We stored per-generation summaries in `avg_fitness_history` and `best_fitness_history`.
+    if avg_fitness_history or best_fitness_history:
+        # Convert to numpy arrays and coerce non-finite values to NaN for safe plotting
+        avg_arr = np.array(avg_fitness_history, dtype=np.float64) if avg_fitness_history else np.array([], dtype=np.float64)
+        best_arr = np.array(best_fitness_history, dtype=np.float64) if best_fitness_history else np.array([], dtype=np.float64)
 
-        generations = np.arange(1, len(avg_fitness) + 1)
+        # Replace non-finite values with NaN so plotting and reductions behave
+        avg_arr = np.where(np.isfinite(avg_arr), avg_arr, np.nan)
+        best_arr = np.where(np.isfinite(best_arr), best_arr, np.nan)
+
+        # Remove outliers using IQR rule per-series: values outside [Q1-1.5*IQR, Q3+1.5*IQR]
+        def remove_outliers_iqr(x: np.ndarray) -> np.ndarray:
+            if x.size == 0:
+                return x
+            # Work on finite values only
+            finite_mask = np.isfinite(x)
+            if not finite_mask.any():
+                return x
+            vals = x[finite_mask]
+            q1 = np.nanpercentile(vals, 25)
+            q3 = np.nanpercentile(vals, 75)
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            out = x.copy()
+            mask_out = (out < lower) | (out > upper)
+            out[mask_out] = np.nan
+            return out
+
+        avg_arr = remove_outliers_iqr(avg_arr)
+
+        # Determine number of generations from the longest summary
+        n_gens = max(len(avg_arr), len(best_arr))
+        generations = np.arange(1, n_gens + 1)
 
         plt.figure(figsize=(8, 4.5))
-        plt.plot(generations, avg_fitness, label="Average fitness", linewidth=2)
-        plt.plot(generations, best_fitness, label="Best fitness", linewidth=2)
+        if avg_arr.size:
+            plt.plot(generations[: len(avg_arr)], avg_arr, label="Average fitness", linewidth=2)
+        if best_arr.size:
+            plt.plot(generations[: len(best_arr)], best_arr, label="Best fitness", linewidth=2)
+
         plt.xlabel("Generation")
         plt.ylabel("Fitness")
         plt.title("Average and Best Fitness Over Generations")
@@ -900,4 +1058,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import time
+    start_time = time.time()
     main()
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    console.log(f"Total execution time: {elapsed_time:.2f} seconds")

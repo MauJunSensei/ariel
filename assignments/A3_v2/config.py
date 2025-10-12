@@ -1,13 +1,13 @@
 from typing import Final
 
 GENOTYPE_SIZE: Final[int] = 64
-POPULATION_SIZE: Final[int] = 100
-GENERATIONS: Final[int] = 10
+POPULATION_SIZE: Final[int] = 256
+GENERATIONS: Final[int] = 100
 MUTATION_RATE: Final[float] = 0.2
 CONTROLLER_HIDDEN_SIZE: Final[int] = 8
-RUN_DURATION: Final[float] = 30.0
+RUN_DURATION: Final[float] = 15.0
 
-MODE: Final[str] = "video"
+MODE: Final[str] = "simple"
 
 MAX_WORKERS: Final[int | None] = None
 PARALLEL_EVAL: Final[bool] = True
@@ -16,14 +16,6 @@ PARALLEL_EVAL: Final[bool] = True
 TOURNAMENT_SIZE: Final[int] = 3
 TOURNAMENT_ROUNDS: Final[int] = 1
 ELITISM_K: Final[int] = 2
-
-# Fitness function weights and thresholds
-# Reward forward progress along +X, penalize lateral deviation (|Y|),
-# penalize bouncing (|dZ/dt|), and jerk in forward motion (|d^2X/dt^2|).
-FIT_W_FORWARD: Final[float] = 1.0
-FIT_W_LATERAL: Final[float] = 0.3
-FIT_W_BOUNCE: Final[float] = 0.1
-FIT_W_SMOOTH: Final[float] = 0.05
 
 # Section thresholds (along X) for the Olympic track; add bonuses when reached.
 # These are approximate waypoints: end of flat, end of rugged, mid-way, near finish.
@@ -38,7 +30,7 @@ TRAIN_CONTROLLER: Final[bool] = True
 
 # Training budget: number of candidate weight vectors to evaluate per body.
 # Keep this small for speed; increase for better controller adaptation.
-TRAIN_BUDGET: Final[int] = 64
+TRAIN_BUDGET: Final[int] = 256
 
 # Duration for controller training rollouts (seconds). Shorter than RUN_DURATION
 # to speed up the inner loop; the final fitness is still measured with RUN_DURATION.
@@ -50,6 +42,6 @@ TRAIN_ALGO: Final[str] = "cma"
 # Quick viability check for initial random bodies
 VIABILITY_CHECK: Final[bool] = True
 VIABILITY_DURATION: Final[float] = 2.0  # seconds
-VIABILITY_MIN_DISPLACEMENT: Final[float] = 0.05  # meters along +X
+VIABILITY_MIN_DISPLACEMENT: Final[float] = 0.25  # meters along +X
 VIABILITY_MAX_ATTEMPTS: Final[int] = 15
 
