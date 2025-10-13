@@ -5,7 +5,7 @@ from typing import Final
 # Core GA / Evolution settings (mirrors A3_v2/config.py)
 GENOTYPE_SIZE: Final[int] = 64
 POPULATION_SIZE: Final[int] = 80  # Smaller for more diversity pressure
-GENERATIONS: Final[int] = 100
+GENERATIONS: Final[int] = 50
 MUTATION_RATE: Final[float] = 0.25  # Higher to create more variation
 MUTATION_STRENGTH: Final[float] = 0.15  # How much genes change when mutated
 CONTROLLER_HIDDEN_SIZE: Final[int] = 8
@@ -45,11 +45,11 @@ REQUIRE_MAX_HINGES: Final[int] = 8  # Cap hinges to avoid over-complex bodies
 PHASE2_TOP_K: Final[int] = 10  # Train top K candidates in Phase 2 (best from Phase 1)
 
 # GA evaluation baseline controller (for morphology screening)
-GA_BASELINE_AMPLITUDE: Final[float] = 0.8  # Stronger actuation
-GA_BASELINE_FREQUENCY: Final[float] = 3.0  # Faster oscillation
+GA_BASELINE_AMPLITUDE: Final[float] = 0.5  # Gentle actuation (more stable)
+GA_BASELINE_FREQUENCY: Final[float] = 2.5  # Stable default
 GA_CTRL_STEP: Final[int] = 10
 GA_SAVE_STEP: Final[int] = 50
-GA_USE_RANDOM_CONTROLLER: Final[bool] = True  # Add randomness to controller for diversity
+GA_USE_RANDOM_CONTROLLER: Final[bool] = False  # Deterministic baseline for stability
 
 # CMA-ES controller type: "nn" (feedforward 3-layer) or "cpg" (sinusoidal)
 CMA_CONTROLLER_TYPE: Final[str] = "cpg"

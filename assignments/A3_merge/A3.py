@@ -206,11 +206,15 @@ def experiment(
     mode: ViewerTypes = "simple",
 ) -> None:
     mj.set_mjcb_control(None)
-    world = OlympicArena(load_precompiled=False)
-    world.spawn(robot.spec, position=SPAWN_POS, correct_collision_with_floor=True)
+    world = OlympicArena()
+    # Use bounding box correction as before; small gap not necessary
+    world.spawn(robot.spec, spawn_position=SPAWN_POS, correct_for_bounding_box=True)
     model = world.spec.compile()
     data = mj.MjData(model)
+    # Increase stability: smaller timestep, Euler integrator, add damping
+    # Keep default integrator/timestep/damping (previous stable config)
     mj.mj_resetData(model, data)
+    mj.mj_forward(model, data)
     controller.tracker.setup(world.spec, data)
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
@@ -383,7 +387,7 @@ def train_controller_cma(best_individual: Individual) -> tuple[float, np.ndarray
     # Build a probe model to determine controller dimensions
     core = construct_mjspec_from_graph(best_individual.graph)
     world_probe = OlympicArena()  # use precompiled arena assets
-    world_probe.spawn(core.spec, position=SPAWN_POS, correct_collision_with_floor=False)
+    world_probe.spawn(core.spec, spawn_position=SPAWN_POS, correct_for_bounding_box=False)
     model_probe = world_probe.spec.compile()
     if cma is None:
         console.log({"phase2_error": "cma_not_installed"})
@@ -419,7 +423,7 @@ def train_controller_cma(best_individual: Individual) -> tuple[float, np.ndarray
         try:
             core_eval = construct_mjspec_from_graph(best_individual.graph)  # rebuild robot spec
             world = OlympicArena()
-            world.spawn(core_eval.spec, position=SPAWN_POS, correct_collision_with_floor=False)
+            world.spawn(core_eval.spec, spawn_position=SPAWN_POS, correct_for_bounding_box=False)
             model = world.spec.compile()
             data = mj.MjData(model)
             mj.mj_resetData(model, data)
