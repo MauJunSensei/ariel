@@ -4,6 +4,8 @@
 from typing import TYPE_CHECKING, Any, cast
 import logging
 from datetime import datetime
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 import matplotlib.pyplot as plt
 import mujoco as mj
@@ -84,6 +86,10 @@ COEV_NUM_EVALS_PER_CANDIDATE = cfg.COEV_NUM_EVALS_PER_CANDIDATE
 COEV_DIVERSITY_WEIGHT = cfg.COEV_DIVERSITY_WEIGHT
 LOG_EVERY_N_GEN = cfg.LOG_EVERY_N_GEN
 
+# Parallel processing configuration
+_workers_config = getattr(cfg, 'NUM_PARALLEL_WORKERS', None)
+NUM_PARALLEL_WORKERS = _workers_config if _workers_config is not None else max(1, cpu_count() - 1)
+
 type Vector = npt.NDArray[np.float64]
 
 # --- LOGGING SETUP --- #
@@ -101,6 +107,7 @@ logger = logging.getLogger(__name__)
 logger.info("="*80)
 logger.info(f"Starting A3 execution at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 logger.info(f"Log file: {log_file_path}")
+logger.info(f"Parallel workers: {NUM_PARALLEL_WORKERS} (CPU count: {cpu_count()})")
 logger.info("="*80)
 
 # --- RANDOM GENERATOR SETUP --- #
@@ -447,7 +454,31 @@ def _flatten_weights(weights: tuple[Vector, Vector, Vector]) -> np.ndarray:
     return np.concatenate([w1.ravel(), w2.ravel(), w3.ravel()])
 
 
-def _objective_minimize_distance(
+def _evaluate_controller_candidate(
+    x: np.ndarray,
+    robot: CoreModule,
+    inp: int,
+    hid: int,
+    out: int,
+    generation: int,
+) -> float:
+    """Helper function for parallel evaluation of controller candidates.
+    
+    Returns distance to minimize (positive values).
+    """
+    try:
+        # Create a new NN instance for this worker
+        nn = NN(robot)
+        weights = _unflatten_weights(x, inp, hid, out)
+        nn.set_controller_weights(weights)
+        fit = evaluate(robot, nn, plot_and_record=False)
+        return -float(fit)  # Return distance (to minimize)
+    except Exception as e:
+        logger.error(f"[Gen {generation}] Error evaluating candidate: {e}")
+        return float('inf')  # Return worst possible fitness on error
+
+
+def _objective_minimize_distance( # type: ignore[no-untyped-def]
     x: np.ndarray,
     robot: CoreModule,
     nn: "NN",
@@ -513,15 +544,29 @@ def train_controller_with_cma(
 
     # Optimize
     gen = 0
-    logger.info("Starting CMA-ES optimization loop...")
+    logger.info(f"Starting CMA-ES optimization loop with {NUM_PARALLEL_WORKERS} parallel workers...")
+    
+    # Get network dimensions for parallel evaluation
+    _D, inp, hid, out = _nn_param_sizes(nn)
+    
     while not es.stop():
         gen += 1
         X = es.ask()
-        # Evaluate all candidates sequentially (can parallelize later)
-        fitnesses: list[float] = []
-        for xi in X:
-            val = _objective_minimize_distance(np.asarray(xi, dtype=float), robot, nn, generation=gen)
-            fitnesses.append(val)
+        
+        # Evaluate all candidates in parallel
+        if NUM_PARALLEL_WORKERS > 1:
+            eval_func = partial(_evaluate_controller_candidate, 
+                              robot=robot, inp=inp, hid=hid, out=out, generation=gen)
+            with Pool(NUM_PARALLEL_WORKERS) as pool:
+                fitnesses = pool.map(eval_func, X)
+        else:
+            # Sequential fallback
+            fitnesses = [_evaluate_controller_candidate(np.asarray(xi, dtype=float), 
+                                                       robot, inp, hid, out, gen) 
+                        for xi in X]
+        
+        # Track best
+        for xi, val in zip(X, fitnesses):
             if val < best_val:
                 best_val = val
                 best_x = np.asarray(xi, dtype=float).copy()
@@ -740,6 +785,71 @@ def _make_controller_for_robot_with_padding(robot: CoreModule, xc: np.ndarray) -
     return nn
 
 
+def _evaluate_coevolution_candidate_worker(
+    args: tuple[np.ndarray, int, set[str]],
+) -> tuple[float, str, bool]:
+    """Worker function for parallel co-evolution evaluation.
+    
+    Returns (fitness, morphology_signature, is_novel).
+    Note: seen_morphologies is passed per-candidate to avoid shared state issues.
+    """
+    x, generation, local_seen = args
+    try:
+        body_len = 3 * GENOTYPE_SIZE
+        ctrl_len = _nn_param_sizes_fixed(COEV_INPUT_SIZE, HIDDEN_SIZE, COEV_MAX_ACTUATORS)
+        xb, xc = _split_genome(x, body_gene_len=body_len, ctrl_len=ctrl_len)
+        
+        robot, diversity_metrics = _build_robot_from_body_genes(xb)
+        nn = _make_controller_for_robot_with_padding(robot, xc)
+        
+        # Quick controller polish (simplified for parallel - no CMA polish in parallel workers)
+        # Use random perturbation polish only
+        best_local_nn = nn
+        best_local_fit = evaluate(
+            robot,
+            best_local_nn,
+            plot_and_record=False,
+            duration_override=COEV_POLISH_EVAL_DURATION,
+        )
+        for _ in range(COEV_POLISH_STEPS):
+            w1, w2, w3 = best_local_nn.weights
+            for _j in range(COEV_POLISH_POPSIZE):
+                c1 = w1 + RNG.normal(0.0, COEV_POLISH_SIGMA, size=w1.shape)
+                c2 = w2 + RNG.normal(0.0, COEV_POLISH_SIGMA, size=w2.shape)
+                c3 = w3 + RNG.normal(0.0, COEV_POLISH_SIGMA, size=w3.shape)
+                trial = _make_controller_for_robot_with_padding(robot, _flatten_weights((c1, c2, c3)))
+                fit_try = evaluate(
+                    robot,
+                    trial,
+                    plot_and_record=False,
+                    duration_override=COEV_POLISH_EVAL_DURATION,
+                )
+                if fit_try > best_local_fit:
+                    best_local_fit = fit_try
+                    best_local_nn = trial
+        nn = best_local_nn
+        
+        # Repeated evaluations for noise reduction
+        fitnesses_raw: list[float] = []
+        for _i in range(COEV_NUM_EVALS_PER_CANDIDATE):
+            fit = evaluate(robot, nn, plot_and_record=False)
+            fitnesses_raw.append(fit)
+        
+        # Use median for robustness
+        raw_fitness = float(np.median(fitnesses_raw))
+        
+        # Compute diversity info (actual novelty will be determined in main thread)
+        morph_sig = f"{diversity_metrics['num_hinges']}_{diversity_metrics['num_modules']}"
+        is_novel = morph_sig not in local_seen
+        
+        # Return negative because CMA minimizes
+        return -(raw_fitness), morph_sig, is_novel
+        
+    except Exception as e:
+        logger.error(f"[Gen {generation}] Error in parallel coevolution evaluation: {e}")
+        return float('inf'), "error", False
+
+
 def _objective_coevolution(x: np.ndarray, seen_morphologies: set[str], generation: int = 0) -> float:
     # Joint genome: [body_genes (3*GENOTYPE_SIZE), controller_weights (fixed-D)]
     body_len = 3 * GENOTYPE_SIZE
@@ -882,7 +992,7 @@ def train_coevolution_with_cma(
     # Track seen morphologies for diversity bonus
     seen_morphologies: set[str] = set()
     
-    logger.info("Starting co-evolution optimization loop...")
+    logger.info(f"Starting co-evolution optimization loop with {NUM_PARALLEL_WORKERS} parallel workers...")
     logger.info("-"*80)
     
     while not es.stop():
@@ -892,13 +1002,43 @@ def train_coevolution_with_cma(
         logger.info(f"="*80)
         logger.info(f"Asking CMA-ES for {pop} candidates...")
         X = es.ask()
-        fitnesses: list[float] = []
-        for idx, xi in enumerate(X):
-            logger.debug(f"[Gen {gen}] Evaluating candidate {idx+1}/{len(X)}")
-            val = _objective_coevolution(np.asarray(xi, dtype=float), seen_morphologies, generation=gen)
-            fitnesses.append(val)
-            if val < best_val:
-                best_val = val
+        
+        # Evaluate population in parallel
+        if NUM_PARALLEL_WORKERS > 1:
+            # Prepare arguments for parallel evaluation
+            # Each worker gets a copy of seen morphologies to check novelty
+            eval_args = [(np.asarray(xi, dtype=float), gen, seen_morphologies.copy()) for xi in X]
+            
+            with Pool(NUM_PARALLEL_WORKERS) as pool:
+                results = pool.map(_evaluate_coevolution_candidate_worker, eval_args)
+            
+            # Process results and update seen morphologies
+            fitnesses: list[float] = []
+            for (raw_fit, morph_sig, _is_novel), xi in zip(results, X):
+                # Check actual novelty against main thread's seen_morphologies
+                actually_novel = morph_sig not in seen_morphologies
+                seen_morphologies.add(morph_sig)
+                
+                # Apply diversity bonus
+                diversity_bonus = COEV_DIVERSITY_WEIGHT if actually_novel else 0.0
+                final_fitness = raw_fit - diversity_bonus  # raw_fit is already negative
+                fitnesses.append(final_fitness)
+                
+                if final_fitness < best_val:
+                    best_val = final_fitness
+                    best_x = np.asarray(xi, dtype=float).copy()
+                    logger.info(f"[Gen {gen}] NEW BEST found! fitness={-best_val:.4f}")
+        else:
+            # Sequential fallback
+            fitnesses = []
+            for idx, xi in enumerate(X):
+                logger.debug(f"[Gen {gen}] Evaluating candidate {idx+1}/{len(X)}")
+                val = _objective_coevolution(np.asarray(xi, dtype=float), seen_morphologies, generation=gen)
+                fitnesses.append(val)
+                if val < best_val:
+                    best_val = val
+                    best_x = np.asarray(xi, dtype=float).copy()
+                    logger.info(f"[Gen {gen}] NEW BEST found! fitness={-best_val:.4f}")
                 best_x = np.asarray(xi, dtype=float).copy()
                 logger.info(f"[Gen {gen}] NEW BEST found! fitness={-best_val:.4f}")
         

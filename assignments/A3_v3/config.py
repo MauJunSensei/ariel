@@ -58,7 +58,7 @@ HINGE_ROTATION_CHOICES: list[str] = [
 # CMA-ES defaults
 CMA_POPSIZE: int = 48  # Increased for better exploration
 CMA_SIGMA0: float = 1.5  # Larger initial step size
-CMA_MAX_GENERATIONS: int = 100  # Run longer
+CMA_MAX_GENERATIONS: int = 3  # Run longer
 
 # Co-evolution controller dimensionality (fixed IO for stable CMA dimension)
 COEV_MAX_ACTUATORS: int = 32  # must be >= possible hinge count
@@ -79,3 +79,8 @@ COEV_DIVERSITY_WEIGHT: float = 0.1      # Weight for diversity term in fitness
 
 # Logging frequency for CMA/co-evolution
 LOG_EVERY_N_GEN: int = 1
+
+# Parallel processing settings
+# Set to 1 to disable parallelization, or None to use (CPU_COUNT - 1)
+# Recommended: leave as None for automatic detection, or set to specific number
+NUM_PARALLEL_WORKERS: int | None = None  # None = auto-detect and use (cpu_count - 1)
