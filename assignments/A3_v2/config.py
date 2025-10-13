@@ -2,10 +2,10 @@ from typing import Final
 
 GENOTYPE_SIZE: Final[int] = 64
 POPULATION_SIZE: Final[int] = 256
-GENERATIONS: Final[int] = 100
+GENERATIONS: Final[int] = 3
 MUTATION_RATE: Final[float] = 0.2
 CONTROLLER_HIDDEN_SIZE: Final[int] = 8
-RUN_DURATION: Final[float] = 15.0
+RUN_DURATION: Final[float] = 30.0
 
 MODE: Final[str] = "simple"
 

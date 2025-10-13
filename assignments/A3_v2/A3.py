@@ -293,11 +293,51 @@ def generate_body(ind: Individual, genes: list[np.ndarray] | None = None) -> Non
 
     # Decode the high-probability graph
     hpd = HighProbabilityDecoder(NUM_OF_MODULES)
-    ind.graph = hpd.probability_matrices_to_graph(
+    base_graph = hpd.probability_matrices_to_graph(
         p_matrices[0],
         p_matrices[1],
         p_matrices[2],
     )
+
+    # Ensure there is a joint (hinge) between every connected pair of blocks
+    def _insert_hinges_between_blocks(graph: Any) -> Any:
+        try:
+            # Determine next available integer node id
+            existing_int_nodes = [int(n) for n in graph.nodes if isinstance(n, int)]
+            next_id = (max(existing_int_nodes) + 1) if existing_int_nodes else 1
+
+            # Snapshot edges to avoid modifying while iterating
+            for u, v, edata in list(graph.edges(data=True)):
+                try:
+                    type_u = graph.nodes[u].get("type")
+                    type_v = graph.nodes[v].get("type")
+                except Exception:
+                    # If node metadata is missing, skip transformation for this edge
+                    continue
+
+                # If either endpoint is already a hinge, assume a joint exists
+                if type_u == "HINGE" or type_v == "HINGE":
+                    continue
+
+                # Original face from parent to child
+                face = edata.get("face", "FRONT")
+
+                # Create a new hinge node
+                hinge_idx = next_id
+                next_id += 1
+                graph.add_node(hinge_idx, type="HINGE", rotation="DEG_0")
+
+                # Replace u->v with u->hinge(face=orig) and hinge->v(face=FRONT)
+                if graph.has_edge(u, v):
+                    graph.remove_edge(u, v)
+                graph.add_edge(u, hinge_idx, face=face)
+                graph.add_edge(hinge_idx, v, face="FRONT")
+        except Exception:
+            # If any unexpected error arises, leave the original graph unchanged
+            return graph
+        return graph
+
+    ind.graph = _insert_hinges_between_blocks(base_graph)
 
 
 def _quick_viability(robot: Any, duration: float, min_dx: float) -> bool:
