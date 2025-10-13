@@ -16,6 +16,7 @@ dependencies = [
   "mujoco>=3.3.6",
   "networkx>=3.2.1",
   "nevergrad>=1.0.12",
+  "cma>=3.2.2",
   "nicegui>=2.24.1",
   "numpy>=2.0.2",
   "numpy-quaternion>=2023.0.3",
