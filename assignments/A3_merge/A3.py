@@ -30,7 +30,7 @@ from mujoco import viewer
 # Local libraries
 from ariel import console
 from ariel.simulation.controllers.controller import Controller
-from ariel.simulation.environments import OlympicArena
+from ariel.simulation.environments import OlympicArena, SimpleFlatWorld
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
 from ariel.utils.tracker import Tracker
@@ -68,7 +68,15 @@ from config import (
     REQUIRE_MIN_HINGES,
     REQUIRE_MAX_HINGES,
     MUTATION_STRENGTH,
+    CROSSOVER_RATE,
+    PHASE1_NUM_SAMPLES,
+    PHASE1_SIM_SECONDS,
+    PHASE1_SPAWN_POS,
+    PHASE1_REQUIRE_HINGE_FIRST_LIMB,
+    PHASE1_TOTAL_HINGE_MIN,
+    PHASE1_TOTAL_HINGE_MAX,
     PHASE2_TOP_K,
+    PHASE2_MIN_FORWARD_DISTANCE,
     GA_BASELINE_AMPLITUDE,
     GA_BASELINE_FREQUENCY,
     GA_CTRL_STEP,
@@ -208,7 +216,7 @@ def experiment(
     mj.set_mjcb_control(None)
     world = OlympicArena()
     # Use bounding box correction as before; small gap not necessary
-    world.spawn(robot.spec, spawn_position=SPAWN_POS, correct_for_bounding_box=True)
+    world.spawn(robot.spec, position=SPAWN_POS, correct_collision_with_floor=True)
     model = world.spec.compile()
     data = mj.MjData(model)
     # Increase stability: smaller timestep, Euler integrator, add damping
@@ -250,22 +258,11 @@ def evaluate(individual: Individual) -> float:
         return -1e9
 
     # Baseline sinusoidal controller to probe morphology viability (headless)
+    # Simple uniform oscillation like A3_clean.py for consistent evaluation
     def baseline_cb(model: mj.MjModel, data: mj.MjData) -> npt.NDArray[np.float64]:
         t = float(data.time)
-        amps = np.full(model.nu, GA_BASELINE_AMPLITUDE)
-        # Add random phase offsets for each individual to create diversity
-        if GA_USE_RANDOM_CONTROLLER:
-            phase_seed = hash(tuple(individual.body_genes[0].flat[:5])) % 100000
-            phase_rng = np.random.default_rng(phase_seed)
-            phases = phase_rng.uniform(0.0, 2*np.pi, model.nu)
-            # Also vary frequency slightly
-            freq_variation = phase_rng.uniform(0.8, 1.2)
-            freq = GA_BASELINE_FREQUENCY * freq_variation
-        else:
-            phases = np.linspace(0.0, np.pi, model.nu, dtype=np.float64)
-            freq = GA_BASELINE_FREQUENCY
-        targets = amps * np.sin(2 * np.pi * freq * t + phases)
-        return np.clip(targets, -np.pi / 2, np.pi / 2)
+        targets = GA_BASELINE_AMPLITUDE * np.sin(2 * np.pi * GA_BASELINE_FREQUENCY * t)
+        return np.clip(np.full(model.nu, targets), -np.pi / 2, np.pi / 2)
 
     ctrl = Controller(
         controller_callback_function=baseline_cb,
@@ -312,6 +309,18 @@ def select_survivors(population: list[Individual], num_survivors: int) -> list[I
     return survivors
 
 
+def crossover(parent1: Individual, parent2: Individual) -> Individual:
+    """Uniform crossover: each gene randomly chosen from parent1 or parent2."""
+    child_genes = []
+    for arr1, arr2 in zip(parent1.body_genes, parent2.body_genes):
+        mask = RNG.random(arr1.shape) < 0.5
+        child_arr = np.where(mask, arr1, arr2).copy()
+        child_genes.append(child_arr)
+    child = Individual(body_genes=child_genes)
+    generate_body(child, genes=child_genes)
+    return child
+
+
 def mutate(individual: Individual) -> None:
     # Mutate inside [0,1] with configurable strength
     for i, arr in enumerate(individual.body_genes):
@@ -325,58 +334,170 @@ def mutate(individual: Individual) -> None:
     individual.fitness = None
 
 
+def _count_hinges(g: Any) -> int:
+    return sum(1 for _, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "HINGE")
+
+
+def _core_children(g: Any) -> list[tuple[int, dict[str, Any]]]:
+    core_nodes = [n for n, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "CORE"]
+    if not core_nodes:
+        return []
+    core = core_nodes[0]
+    return [(v, g.nodes[v]) for _, v in g.out_edges(core)]
+
+
+def _is_hinge_first_limb(g: Any) -> bool:
+    """Return True if at least one limb from core begins with a hinge, or a hinge appears at depth 2.
+    This is less strict than requiring all limbs to start with a hinge.
+    """
+    children = _core_children(g)
+    if not children:
+        return False
+    # Accept if any direct child is a hinge
+    for _, attrs in children:
+        if str(attrs.get("type", "")).upper() == "HINGE":
+            return True
+    # Otherwise, check grandchildren one step away
+    for node_id, _ in children:
+        for _, gc_id in g.out_edges(node_id):
+            gc_attrs = g.nodes[gc_id]
+            if str(gc_attrs.get("type", "")).upper() == "HINGE":
+                return True
+    return False
+
+
+def _graph_is_viable_for_motion(g: Any) -> tuple[bool, str]:
+    num_hinges = _count_hinges(g)
+    if num_hinges < PHASE1_TOTAL_HINGE_MIN:
+        return False, f"too_few_hinges:{num_hinges}"
+    if num_hinges > PHASE1_TOTAL_HINGE_MAX:
+        return False, f"too_many_hinges:{num_hinges}"
+    if PHASE1_REQUIRE_HINGE_FIRST_LIMB and not _is_hinge_first_limb(g):
+        return False, "no_hinge_first_limb"
+    return True, "ok"
+
+
+def _evaluate_displacement(core: Any, seconds: float) -> tuple[float, float]:
+    # Screen on SimpleFlat for stability and speed
+    world = SimpleFlatWorld()
+    try:
+        world.spawn(core.spec, position=PHASE1_SPAWN_POS, correct_collision_with_floor=True)
+        model = world.spec.compile()
+    except Exception:
+        return -np.inf, -np.inf
+    data = mj.MjData(model)
+    # Deterministic gentle multi-phase oscillation
+    phases = None
+    def cb(m: mj.MjModel, d: mj.MjData) -> None:
+        nonlocal phases
+        if phases is None:
+            phases = np.linspace(0.0, 2 * np.pi, m.nu, endpoint=False)
+        t = float(d.time)
+        targets = GA_BASELINE_AMPLITUDE * np.sin(2 * np.pi * GA_BASELINE_FREQUENCY * t + phases)
+        d.ctrl[:] = np.clip(targets, -np.pi / 2, np.pi / 2)
+    if model.nu == 0:
+        return -np.inf, -np.inf
+    mj.set_mjcb_control(cb)
+    dt = model.opt.timestep
+    steps = max(1, int(seconds / dt))
+    try:
+        core_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "core")
+        x0 = float(data.xpos[core_bid, 0]); y0 = float(data.xpos[core_bid, 1])
+    except Exception:
+        x0 = float(data.qpos[0]) if len(data.qpos) > 0 else 0.0
+        y0 = float(data.qpos[1]) if len(data.qpos) > 1 else 0.0
+    for _ in range(steps):
+        mj.mj_step(model, data)
+    try:
+        core_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "core")
+        x1 = float(data.xpos[core_bid, 0]); y1 = float(data.xpos[core_bid, 1])
+    except Exception:
+        x1 = float(data.qpos[0]) if len(data.qpos) > 0 else 0.0
+        y1 = float(data.qpos[1]) if len(data.qpos) > 1 else 0.0
+    return x1 - x0, float(np.hypot(x1 - x0, y1 - y0))
+
+
+def sample_bodies(num_samples: int) -> list[Individual]:
+    console.rule("Phase 1: Random Morphology Sampling (NDE→HPD)")
+    nde = NeuralDevelopmentalEncoding(number_of_modules=NUM_OF_MODULES)
+    hpd = HighProbabilityDecoder(NUM_OF_MODULES)
+    individuals: list[Individual] = []
+    kept = 0
+    for i in range(num_samples):
+        genes = [RNG.random(GENOTYPE_SIZE).astype(np.float32) for _ in range(3)]
+        ind = Individual(body_genes=genes)
+        try:
+            p_types, p_conns, p_rots = nde.forward(genes)
+            g = hpd.probability_matrices_to_graph(p_types, p_conns, p_rots)
+        except Exception:
+            continue
+        # Guardrails similar to generate_body
+        if ENFORCE_GUARDRAILS:
+            import networkx as nx
+            to_remove = [n for n, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "NONE"]
+            if to_remove:
+                g.remove_nodes_from(to_remove)
+            if g.number_of_nodes() == 0:
+                console.log({"reject": "all_none"}); continue
+            core_nodes = [n for n, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "CORE"]
+            if core_nodes:
+                core_n = core_nodes[0]
+                reachable = nx.descendants(g, core_n) | {core_n}
+                g = g.subgraph(reachable).copy()
+            if g.number_of_nodes() == 0:
+                console.log({"reject": "not_core_reachable"}); continue
+        # Motion viability filters
+        ok, reason = _graph_is_viable_for_motion(g)
+        if not ok:
+            if reason == "no_hinge_first_limb":
+                # brief debug types of core children to aid tuning
+                cc = [(nid, str(g.nodes[nid].get("type", "")).upper()) for nid, _ in _core_children(g)]
+                console.log({"reject": reason, "core_children": cc})
+            else:
+                console.log({"reject": reason})
+            continue
+        ind.graph = g
+        individuals.append(ind)
+        kept += 1
+        if kept % 50 == 0:
+            console.log({"kept": kept, "sampled": i + 1})
+    console.log({"sampled_total": num_samples, "kept": kept})
+    return individuals
+
+
 def run_body_evolution() -> tuple[float, list[Individual]]:
-    console.rule("Phase 1: Body Evolution (GA)")
-    console.log({"population": POPULATION_SIZE, "generations": GENERATIONS})
-    population = [Individual(body_genes=generate_body_genes()) for _ in range(POPULATION_SIZE)]
-    for ind in population:
-        generate_body(ind)
-    
-    # Track all unique individuals across all generations
-    candidates: dict[int, Individual] = {}  # keyed by id to avoid duplicates
-    
-    for gen in range(GENERATIONS):
-        console.log(f"Generation {gen + 1}/{GENERATIONS}")
-        evaluate_all(population)
-        fitness_vals = [float(ind.fitness) for ind in population if ind.fitness is not None]
-        if fitness_vals:
-            gen_best_fit = max(fitness_vals)
-            console.log({"best_fitness": gen_best_fit})
-            # Collect ALL individuals with valid fitness and graph
-            for ind in population:
-                if ind.fitness is not None and ind.graph is not None:
-                    ind_id = id(ind)
-                    if ind_id not in candidates:
-                        cand = Individual(body_genes=[arr.copy() for arr in ind.body_genes])
-                        cand.graph = ind.graph
-                        cand.fitness = ind.fitness
-                        candidates[ind_id] = cand
-        survivors = select_survivors(population, num_survivors=POPULATION_SIZE // 2)
-        offspring: list[Individual] = []
-        for ind in survivors:
-            child = Individual(body_genes=[arr.copy() for arr in ind.body_genes])
-            generate_body(child, child.body_genes)
-            mutate(child)
-            offspring.append(child)
-        population = survivors + offspring
-    
-    # Sort all candidates by fitness and take top K
-    cand_list = sorted(candidates.values(), key=lambda c: float(c.fitness or -1e12), reverse=True)
-    top_candidates = cand_list[:PHASE2_TOP_K]
-    console.log({"phase1_done": True, "total_candidates": len(cand_list), "top_k_selected": len(top_candidates)})
-    
-    if top_candidates:
-        best_fit = float(top_candidates[0].fitness or -1e12)
-        # Save top candidate graph
-        if top_candidates[0].graph is not None:
-            json_path = DATA / "best_robot_graph.json"
-            png_path = DATA / "best_robot_graph.png"
-            save_graph_as_json(top_candidates[0].graph, save_file=json_path)
-            draw_graph(top_candidates[0].graph, title=f"Best graph (fit={best_fit:.3f})", save_file=png_path)
-            console.log({"saved_graph": str(json_path), "saved_image": str(png_path)})
+    # Phase 1 replaced by assignment-compliant random sampling + viability check
+    inds = sample_bodies(PHASE1_NUM_SAMPLES)
+    # Evaluate displacement with short sim
+    scored: list[tuple[float, float, Individual]] = []  # (dx, dist, ind)
+    for ind in inds:
+        if ind.graph is None:
+            continue
+        try:
+            core = construct_mjspec_from_graph(ind.graph)
+        except Exception:
+            continue
+        dx, dist = _evaluate_displacement(core, PHASE1_SIM_SECONDS)
+        scored.append((dx, dist, ind))
+    # Prefer forward movers; if none, use absolute displacement
+    movers = [(dx, dist, ind) for dx, dist, ind in scored if dx > 0.0]
+    if movers:
+        movers.sort(key=lambda t: t[0], reverse=True)
+        top = movers[:PHASE2_TOP_K]
+        console.log({"phase1_done": True, "candidates_forward": len(movers), "selected": len(top)})
     else:
-        best_fit = -1e12
-    
+        scored.sort(key=lambda t: t[1], reverse=True)
+        top = scored[:PHASE2_TOP_K]
+        console.log({"phase1_done": True, "candidates_any": len(scored), "selected": len(top), "note": "no forward movers"})
+    top_candidates = [ind for _, _, ind in top]
+    best_fit = float(top[0][0]) if top else -1e12
+    # Save top graph preview if available
+    if top_candidates and top_candidates[0].graph is not None:
+        json_path = DATA / "best_robot_graph.json"
+        png_path = DATA / "best_robot_graph.png"
+        save_graph_as_json(top_candidates[0].graph, save_file=json_path)
+        draw_graph(top_candidates[0].graph, title=f"Best graph (dx={best_fit:.3f})", save_file=png_path)
+        console.log({"saved_graph": str(json_path), "saved_image": str(png_path)})
     return best_fit, top_candidates
 
 
@@ -385,10 +506,24 @@ def train_controller_cma(best_individual: Individual) -> tuple[float, np.ndarray
     if best_individual.graph is None:
         raise ValueError("Best individual has no graph")
     # Build a probe model to determine controller dimensions
-    core = construct_mjspec_from_graph(best_individual.graph)
-    world_probe = OlympicArena()  # use precompiled arena assets
-    world_probe.spawn(core.spec, spawn_position=SPAWN_POS, correct_for_bounding_box=False)
-    model_probe = world_probe.spec.compile()
+    # Probe model for dimensions; robust to errors
+    try:
+        core = construct_mjspec_from_graph(best_individual.graph)
+        world_probe = OlympicArena()
+        # try preferred spawn
+        try:
+            world_probe.spawn(core.spec, position=PHASE1_SPAWN_POS, correct_collision_with_floor=True)
+            model_probe = world_probe.spec.compile()
+        except Exception:
+            # retry slightly above
+            pos2 = list(PHASE1_SPAWN_POS)
+            pos2[2] = float(pos2[2]) + 0.05
+            world_probe = OlympicArena()
+            world_probe.spawn(core.spec, position=pos2, correct_collision_with_floor=True)
+            model_probe = world_probe.spec.compile()
+    except Exception as e:
+        console.log({"phase2_error": f"probe_compile_failed: {e}"})
+        return -np.inf, np.array([])
     if cma is None:
         console.log({"phase2_error": "cma_not_installed"})
         return -np.inf, np.array([])
@@ -421,13 +556,21 @@ def train_controller_cma(best_individual: Individual) -> tuple[float, np.ndarray
     def objective(vec: np.ndarray) -> float:
         # Build fresh robot and world per evaluation to ensure clean state
         try:
-            core_eval = construct_mjspec_from_graph(best_individual.graph)  # rebuild robot spec
+            core_eval = construct_mjspec_from_graph(best_individual.graph)
             world = OlympicArena()
-            world.spawn(core_eval.spec, spawn_position=SPAWN_POS, correct_for_bounding_box=False)
-            model = world.spec.compile()
+            try:
+                world.spawn(core_eval.spec, position=PHASE1_SPAWN_POS, correct_collision_with_floor=True)
+                model = world.spec.compile()
+            except Exception:
+                pos2 = list(PHASE1_SPAWN_POS)
+                pos2[2] = float(pos2[2]) + 0.05
+                world = OlympicArena()
+                world.spawn(core_eval.spec, position=pos2, correct_collision_with_floor=True)
+                model = world.spec.compile()
             data = mj.MjData(model)
             mj.mj_resetData(model, data)
-        except Exception:
+        except Exception as e:
+            console.log({"phase2_eval_error": str(e)})
             return 1e9
 
         weights = _decode_weights(vec)
@@ -514,12 +657,25 @@ def main() -> None:
     if not candidates:
         console.log({"error": "no_candidates_found"})
         return
-    
+    # Preflight Phase 2: filter candidates that cannot compile or have no actuators
+    valid_candidates: list[Individual] = []
+    for ind in candidates:
+        try:
+            core = construct_mjspec_from_graph(ind.graph)  # type: ignore[arg-type]
+            model = core.spec.compile()
+            if model.nu == 0:
+                continue
+            valid_candidates.append(ind)
+        except Exception:
+            continue
+    if not valid_candidates:
+        console.log({"error": "no_valid_phase2_candidates"})
+        return
     # Phase 2: train each candidate and pick overall best
     console.rule("Phase 2: Controller Training (CMA-ES)")
-    console.log({"training_candidates": len(candidates)})
+    console.log({"training_candidates": len(valid_candidates)})
     results: list[tuple[float, Individual, np.ndarray]] = []
-    for idx, cand in enumerate(candidates):
+    for idx, cand in enumerate(valid_candidates):
         console.log({"training_candidate": idx + 1, "phase1_fitness": float(cand.fitness or -1e12)})
         ctrl_fit, theta = train_controller_cma(cand)
         results.append((ctrl_fit, cand, theta))
@@ -528,7 +684,7 @@ def main() -> None:
     # Pick overall best
     best_result = max(results, key=lambda r: r[0])
     best_ctrl_fit, best_cand, best_theta = best_result
-    console.log({"phase2_done": True, "best_ctrl_fitness": float(best_ctrl_fit), "from_candidate": candidates.index(best_cand) + 1})
+    console.log({"phase2_done": True, "best_ctrl_fitness": float(best_ctrl_fit), "from_candidate": valid_candidates.index(best_cand) + 1})
     
     # Save overall best controller
     if CMA_CONTROLLER_TYPE == "cpg":

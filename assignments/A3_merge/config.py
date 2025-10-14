@@ -8,8 +8,9 @@ POPULATION_SIZE: Final[int] = 80  # Smaller for more diversity pressure
 GENERATIONS: Final[int] = 50
 MUTATION_RATE: Final[float] = 0.25  # Higher to create more variation
 MUTATION_STRENGTH: Final[float] = 0.15  # How much genes change when mutated
+CROSSOVER_RATE: Final[float] = 0.5  # Probability of crossover vs mutation-only
 CONTROLLER_HIDDEN_SIZE: Final[int] = 8
-RUN_DURATION: Final[float] = 30.0  # Shorter for faster iterations
+RUN_DURATION: Final[float] = 25.0  # Balance between evaluation time and accuracy
 
 MODE: Final[str] = "simple"
 
@@ -41,15 +42,24 @@ ENFORCE_GUARDRAILS: Final[bool] = True
 REQUIRE_MIN_HINGES: Final[int] = 2  # Require at least 2 actuators for movement
 REQUIRE_MAX_HINGES: Final[int] = 8  # Cap hinges to avoid over-complex bodies
 
+# Phase 1: random NDE sampling settings (assignment-compliant morphology discovery)
+PHASE1_NUM_SAMPLES: Final[int] = 1000  # Number of random bodies to sample
+PHASE1_SIM_SECONDS: Final[float] = 5.0  # Slightly longer viability sim per body
+PHASE1_SPAWN_POS: Final[list[float]] = [-1.0, 0.0, 0.12]  # Flat section spawn
+PHASE1_REQUIRE_HINGE_FIRST_LIMB: Final[bool] = True  # Core children must be hinges
+PHASE1_TOTAL_HINGE_MIN: Final[int] = 2
+PHASE1_TOTAL_HINGE_MAX: Final[int] = 16
+
 # Phase 2: train multiple candidates
 PHASE2_TOP_K: Final[int] = 10  # Train top K candidates in Phase 2 (best from Phase 1)
+PHASE2_MIN_FORWARD_DISTANCE: Final[float] = 0.05  # Minimum forward movement (meters) to qualify for Phase 2
 
 # GA evaluation baseline controller (for morphology screening)
-GA_BASELINE_AMPLITUDE: Final[float] = 0.5  # Gentle actuation (more stable)
-GA_BASELINE_FREQUENCY: Final[float] = 2.5  # Stable default
+GA_BASELINE_AMPLITUDE: Final[float] = 0.8  # Stronger for better movement detection
+GA_BASELINE_FREQUENCY: Final[float] = 2.0  # Stable frequency
 GA_CTRL_STEP: Final[int] = 10
 GA_SAVE_STEP: Final[int] = 50
-GA_USE_RANDOM_CONTROLLER: Final[bool] = False  # Deterministic baseline for stability
+GA_USE_RANDOM_CONTROLLER: Final[bool] = False  # Deterministic baseline for fair comparison
 
 # CMA-ES controller type: "nn" (feedforward 3-layer) or "cpg" (sinusoidal)
 CMA_CONTROLLER_TYPE: Final[str] = "cpg"
