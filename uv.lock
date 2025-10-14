@@ -233,6 +233,7 @@ name = "ariel"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cma" },
     { name = "deap" },
     { name = "ipykernel" },
     { name = "jupyter" },
@@ -307,6 +308,7 @@ stubs = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cma", specifier = ">=3.2.2" },
     { name = "deap", specifier = ">=1.4.3" },
     { name = "ipykernel", specifier = ">=6.30.1" },
     { name = "jupyter", specifier = ">=1.1.1" },
