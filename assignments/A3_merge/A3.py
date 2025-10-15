@@ -103,7 +103,7 @@ RNG = np.random.default_rng(SEED)
 
 # Data dirs
 SCRIPT_NAME = __file__.split("/")[-1][:-3]
-CWD = Path.cwd()
+CWD = Path(__file__).parent
 DATA = CWD / "__data__" / SCRIPT_NAME
 DATA.mkdir(exist_ok=True)
 
@@ -377,6 +377,14 @@ def _graph_is_viable_for_motion(g: Any) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _count_module_types(g: Any) -> tuple[int, int, int]:
+    """Count CORE, HINGE, BRICK modules in graph."""
+    num_core = sum(1 for _, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "CORE")
+    num_hinge = sum(1 for _, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "HINGE")
+    num_brick = sum(1 for _, d in g.nodes(data=True) if str(d.get("type", "")).upper() == "BRICK")
+    return num_core, num_hinge, num_brick
+
+
 def _evaluate_displacement(core: Any, seconds: float) -> tuple[float, float]:
     # Screen on SimpleFlat for stability and speed
     world = SimpleFlatWorld()
@@ -470,15 +478,30 @@ def run_body_evolution() -> tuple[float, list[Individual]]:
     inds = sample_bodies(PHASE1_NUM_SAMPLES)
     # Evaluate displacement with short sim
     scored: list[tuple[float, float, Individual]] = []  # (dx, dist, ind)
-    for ind in inds:
+    records: list[tuple[int, float, float, int, int, int]] = []
+    
+    for idx, ind in enumerate(inds):
         if ind.graph is None:
+            records.append((idx, -np.inf, -np.inf, 0, 0, 0))
             continue
         try:
             core = construct_mjspec_from_graph(ind.graph)
         except Exception:
+            records.append((idx, -np.inf, -np.inf, 0, 0, 0))
             continue
         dx, dist = _evaluate_displacement(core, PHASE1_SIM_SECONDS)
         scored.append((dx, dist, ind))
+        c, h, b = _count_module_types(ind.graph)
+        records.append((idx, float(dx), float(dist), c, h, b))
+    
+    # Save CSV log
+    import csv
+    csv_path = DATA / "phase1_samples.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["idx", "dx", "dist", "num_core", "num_hinge", "num_brick"])
+        writer.writerows(records)
+    console.log({"saved_csv": str(csv_path)})
     # Prefer forward movers; if none, use absolute displacement
     movers = [(dx, dist, ind) for dx, dist, ind in scored if dx > 0.0]
     if movers:
