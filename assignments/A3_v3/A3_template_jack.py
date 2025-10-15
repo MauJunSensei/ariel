@@ -69,6 +69,7 @@ NUM_OF_MODULES = cfg.NUM_OF_MODULES
 RNG = cfg.RNG
 SPAWN_POS = cfg.SPAWN_POS
 TARGET_POSITION = cfg.TARGET_POSITION
+CENTERLINE_PENALTY_WEIGHT = getattr(cfg, "CENTERLINE_PENALTY_WEIGHT", 0.0)
 ViewerTypes = cfg.ViewerTypes
 P_HINGE = cfg.P_HINGE
 HINGE_ROTATION_CHOICES = cfg.HINGE_ROTATION_CHOICES
@@ -93,16 +94,21 @@ NUM_PARALLEL_WORKERS = _workers_config if _workers_config is not None else max(1
 type Vector = npt.NDArray[np.float64]
 
 # --- LOGGING SETUP --- #
-# Configure comprehensive logging to file (overwrite mode)
-log_file_path = _config_path.parent / "A3_execution.log"
+# Configure logging to file inside DATA (same folder as graphs), append mode
+log_file_path = DATA / "log.txt"
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(funcName)s - %(message)s',
+    force=True,
     handlers=[
-        logging.FileHandler(log_file_path, mode='w'),  # 'w' mode overwrites old logs
-        logging.StreamHandler()  # Also output to console
-    ]
+        logging.FileHandler(log_file_path, mode='a', encoding='utf-8'),
+        logging.StreamHandler(),
+    ],
 )
+# Limit console verbosity: keep only WARNING+ from logger; we'll print our own concise progress lines
+for _h in logging.getLogger().handlers:
+    if isinstance(_h, logging.StreamHandler):
+        _h.setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.info("="*80)
 logger.info(f"Starting A3 execution at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -110,85 +116,107 @@ logger.info(f"Log file: {log_file_path}")
 logger.info(f"Parallel workers: {NUM_PARALLEL_WORKERS} (CPU count: {cpu_count()})")
 logger.info("="*80)
 
-# --- RANDOM GENERATOR SETUP --- #
 # --- configuration values are imported from assignments.A3_v3.config --- #
 
 
 def fitness_function(history: list[tuple[float, float, float]]) -> float:
+    """Fitness = negative of (final distance + centerline deviation penalty).
+
+    Centerline penalty: mean perpendicular distance from each tracked position
+    to the straight line between SPAWN_POS and TARGET_POSITION.
+    """
     xt, yt, zt = TARGET_POSITION
+    xs, ys = SPAWN_POS[:2]
     xc, yc, zc = history[-1]
 
-    # Minimize the distance --> maximize the negative distance
-    cartesian_distance = np.sqrt(
-        (xt - xc) ** 2 + (yt - yc) ** 2 + (zt - zc) ** 2,
+    # Base objective: final Euclidean distance to target
+    final_distance = float(np.sqrt((xt - xc) ** 2 + (yt - yc) ** 2 + (zt - zc) ** 2))
+
+    # Centerline penalty
+    penalty = 0.0
+    if CENTERLINE_PENALTY_WEIGHT > 0.0 and len(history) > 1:
+        # Line defined by S -> T in 3D; we penalize perpendicular distance in XY plane by default.
+        # Use a robust computation: distance from point P to line through S with direction (T - S).
+        S = np.array([xs, ys], dtype=float)
+        T = np.array([xt, yt], dtype=float)
+        D = T - S
+        denom = float(np.linalg.norm(D))
+        if denom > 1e-9:
+            D_unit = D / denom
+            H = np.asarray(history, dtype=float)
+            Pxy = H[:, :2]
+            # Vector from S to each P
+            V = Pxy - S
+            # Perpendicular component magnitude via cross product norm in 2D -> area formula
+            # |V x D_unit| in 2D treated as scalar: |vx*dy - vy*dx|
+            cross = np.abs(V[:, 0] * D_unit[1] - V[:, 1] * D_unit[0])
+            mean_perp_dist = float(np.mean(cross))
+            penalty = CENTERLINE_PENALTY_WEIGHT * mean_perp_dist
+
+    total = final_distance + penalty
+    logger.debug(
+        "Fitness calculation: final_dist=%.4f, penalty=%.4f, total=%.4f (fitness=%.4f)",
+        final_distance,
+        penalty,
+        total,
+        -total,
     )
-    logger.debug(f"Fitness calculation: distance={cartesian_distance:.4f}, final_pos=({xc:.3f}, {yc:.3f}, {zc:.3f})")
-    return -cartesian_distance
+    return -total
 
 
 def show_xpos_history(history: list[float]) -> None:
-    # Create a tracking camera
-    camera = mj.MjvCamera()
-    camera.type = mj.mjtCamera.mjCAMERA_FREE
-    camera.lookat = [2.5, 0, 0]
-    camera.distance = 10
-    camera.azimuth = 0
-    camera.elevation = -90
+    """Plot the robot trajectory in world XY coordinates.
 
-    # Initialize world to get the background
-    mj.set_mjcb_control(None)
-    world = OlympicArena()
-    model = world.spec.compile()
-    data = mj.MjData(model)
-    save_path = str(DATA / "background.png")
-    single_frame_renderer(
-        model,
-        data,
-        save_path=save_path,
-        save=True,
-    )
+    This avoids fragile pixel-to-world mapping by plotting directly in meters.
+    Applies the requested flip on X and Y (multiply by -1).
+    """
+    pos_data = np.array(history, dtype=float)
+    if pos_data.ndim != 2 or pos_data.shape[1] < 2:
+        logger.warning("show_xpos_history: history array has unexpected shape; skipping plot")
+        return
 
-    # Setup background image
-    img = plt.imread(save_path)
-    _, ax = plt.subplots()
-    ax.imshow(img)
-    w, h, _ = img.shape
+    # Apply orientation transforms
+    x = pos_data[:, 0].copy()
+    y = pos_data[:, 1].copy()
+    # Optional swap first
+    if getattr(cfg, "PLOT_SWAP_XY", False):
+        x, y = y, x
+    # Optional per-axis flips
+    if getattr(cfg, "PLOT_FLIP_X", False):
+        x = -x
+    if getattr(cfg, "PLOT_FLIP_Y", False):
+        y = -y
 
-    # Convert list of [x,y,z] positions to numpy array
-    pos_data = np.array(history)
+    plt.figure(figsize=(8, 6))
+    ax = plt.gca()
+    ax.plot(x, y, "b-", label="Path")
+    ax.plot(x[0], y[0], "go", label="Start")
+    ax.plot(x[-1], y[-1], "ro", label="End")
 
-    # Calculate initial position
-    x0, y0 = int(h * 0.483), int(w * 0.815)
-    xc, yc = int(h * 0.483), int(w * 0.9205)
-    ym0, ymc = 0, SPAWN_POS[0]
+    # Mark target using the same orientation transforms
+    tx, ty = TARGET_POSITION[0], TARGET_POSITION[1]
+    if getattr(cfg, "PLOT_SWAP_XY", False):
+        tx, ty = ty, tx
+    if getattr(cfg, "PLOT_FLIP_X", False):
+        tx = -tx
+    if getattr(cfg, "PLOT_FLIP_Y", False):
+        ty = -ty
+    ax.plot([tx], [ty], marker="x", color="k", label="Target")
 
-    # Convert position data to pixel coordinates
-    pixel_to_dist = -((ymc - ym0) / (yc - y0))
-    pos_data_pixel = [[xc, yc]]
-    for i in range(len(pos_data) - 1):
-        xi, yi, _ = pos_data[i]
-        xj, yj, _ = pos_data[i + 1]
-        xd, yd = (xj - xi) / pixel_to_dist, (yj - yi) / pixel_to_dist
-        xn, yn = pos_data_pixel[i]
-        pos_data_pixel.append([xn + int(xd), yn + int(yd)])
-    pos_data_pixel = np.array(pos_data_pixel)
-
-    # Plot x,y trajectory
-    ax.plot(x0, y0, "kx", label="[0, 0, 0]")
-    ax.plot(xc, yc, "go", label="Start")
-    ax.plot(pos_data_pixel[:, 0], pos_data_pixel[:, 1], "b-", label="Path")
-    ax.plot(pos_data_pixel[-1, 0], pos_data_pixel[-1, 1], "ro", label="End")
-
-    # Add labels and title
-    ax.set_xlabel("X Position")
-    ax.set_ylabel("Y Position")
-    ax.legend()
-
-    # Title
-    plt.title("Robot Path in XY Plane")
-
-    # Show results
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_aspect("equal", adjustable="box")
+    # Add a margin so start isn't clipped
+    xpad = max(0.5, 0.05 * (np.max(x) - np.min(x) + 1e-6))
+    ypad = max(0.5, 0.05 * (np.max(y) - np.min(y) + 1e-6))
+    ax.set_xlim(np.min(x) - xpad, np.max(x) + xpad)
+    ax.set_ylim(np.min(y) - ypad, np.max(y) + ypad)
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.3)
+    plt.title("Robot Path in XY (world)")
+    plt.tight_layout()
     plt.savefig(DATA / "robot_path.png")
+    plt.close()
 
 
 def create_robot_body(
@@ -591,6 +619,12 @@ def train_controller_with_cma(
     nn.set_controller_weights(best_weights)
     best_fitness = -best_val  # convert back to our fitness sign
     logger.info(f"Best fitness (negative distance): {best_fitness:.4f}")
+    # Persist weights to DATA
+    _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _weights_path = DATA / f"controller_weights_cma_{_ts}.npz"
+    _save_controller_weights(nn, _weights_path)
+    # Also update a stable alias to the most recent
+    _save_controller_weights(nn, DATA / "controller_weights_latest.npz")
     logger.info("="*60)
     return nn, best_fitness, best_x
 
@@ -662,6 +696,20 @@ class NN:
 
         # Scale the outputs
         return outputs * np.pi
+
+
+# --- Persistence helpers --- #
+def _save_controller_weights(nn: "NN", destination: _Path | str) -> None:
+    """Save controller weights to a .npz file at destination.
+
+    The file contains arrays: w1, w2, w3.
+    """
+    try:
+        w1, w2, w3 = nn.weights
+        np.savez(destination, w1=w1, w2=w2, w3=w3)
+        logger.info(f"Saved controller weights to: {destination}")
+    except Exception as e:
+        logger.warning(f"Failed to save controller weights to {destination}: {e}")
 
 
 # ========= Co-evolution support ========= #
@@ -850,7 +898,7 @@ def _evaluate_coevolution_candidate_worker(
         return float('inf'), "error", False
 
 
-def _objective_coevolution(x: np.ndarray, seen_morphologies: set[str], generation: int = 0) -> float:
+def _objective_coevolution(x: np.ndarray, seen_morphologies: set[str], generation: int = 0) -> float: # type: ignore
     # Joint genome: [body_genes (3*GENOTYPE_SIZE), controller_weights (fixed-D)]
     body_len = 3 * GENOTYPE_SIZE
     ctrl_len = _nn_param_sizes_fixed(COEV_INPUT_SIZE, HIDDEN_SIZE, COEV_MAX_ACTUATORS)
@@ -988,6 +1036,9 @@ def train_coevolution_with_cma(
     best_val = math.inf
     best_x = x0.copy()
     gen = 0
+    # Per-generation metrics (evaluate() fitness = -distance; we derive from raw distances)
+    gen_avg_fitness: list[float] = []
+    gen_best_fitness: list[float] = []
     
     # Track seen morphologies for diversity bonus
     seen_morphologies: set[str] = set()
@@ -1003,57 +1054,57 @@ def train_coevolution_with_cma(
         logger.info(f"Asking CMA-ES for {pop} candidates...")
         X = es.ask()
         
-        # Evaluate population in parallel
+        # Evaluate population (parallel or sequential) using the same worker to collect raw distances
+        eval_args = [(np.asarray(xi, dtype=float), gen, seen_morphologies.copy()) for xi in X]
         if NUM_PARALLEL_WORKERS > 1:
-            # Prepare arguments for parallel evaluation
-            # Each worker gets a copy of seen morphologies to check novelty
-            eval_args = [(np.asarray(xi, dtype=float), gen, seen_morphologies.copy()) for xi in X]
-            
             with Pool(NUM_PARALLEL_WORKERS) as pool:
                 results = pool.map(_evaluate_coevolution_candidate_worker, eval_args)
-            
-            # Process results and update seen morphologies
-            fitnesses: list[float] = []
-            for (raw_fit, morph_sig, _is_novel), xi in zip(results, X):
-                # Check actual novelty against main thread's seen_morphologies
-                actually_novel = morph_sig not in seen_morphologies
-                seen_morphologies.add(morph_sig)
-                
-                # Apply diversity bonus
-                diversity_bonus = COEV_DIVERSITY_WEIGHT if actually_novel else 0.0
-                final_fitness = raw_fit - diversity_bonus  # raw_fit is already negative
-                fitnesses.append(final_fitness)
-                
-                if final_fitness < best_val:
-                    best_val = final_fitness
-                    best_x = np.asarray(xi, dtype=float).copy()
-                    logger.info(f"[Gen {gen}] NEW BEST found! fitness={-best_val:.4f}")
         else:
-            # Sequential fallback
-            fitnesses = []
-            for idx, xi in enumerate(X):
-                logger.debug(f"[Gen {gen}] Evaluating candidate {idx+1}/{len(X)}")
-                val = _objective_coevolution(np.asarray(xi, dtype=float), seen_morphologies, generation=gen)
-                fitnesses.append(val)
-                if val < best_val:
-                    best_val = val
-                    best_x = np.asarray(xi, dtype=float).copy()
-                    logger.info(f"[Gen {gen}] NEW BEST found! fitness={-best_val:.4f}")
+            # Sequential evaluation using worker logic for consistent metrics
+            results = [_evaluate_coevolution_candidate_worker(args) for args in eval_args]
+
+        # Process results and update seen morphologies; compute final fitness for CMA
+        fitnesses: list[float] = []
+        raw_distances: list[float] = []
+        for (raw_fit, morph_sig, _is_novel), xi in zip(results, X):
+            # 'raw_fit' is distance (>=0). Convert to evaluate() fitness by negating when aggregating.
+            raw_distances.append(float(raw_fit))
+
+            # Novelty/diversity handling (apply once in main thread)
+            actually_novel = morph_sig not in seen_morphologies
+            seen_morphologies.add(morph_sig)
+            diversity_bonus = COEV_DIVERSITY_WEIGHT if actually_novel else 0.0
+
+            # CMA minimizes: distance - diversity
+            final_fitness = float(raw_fit) - diversity_bonus
+            fitnesses.append(final_fitness)
+
+            if final_fitness < best_val:
+                best_val = final_fitness
                 best_x = np.asarray(xi, dtype=float).copy()
-                logger.info(f"[Gen {gen}] NEW BEST found! fitness={-best_val:.4f}")
+                logger.info(f"[Gen {gen}] NEW BEST found! distance={best_val:.4f} (lower is better)")
+
+        # Aggregate per-generation metrics in evaluate() fitness space (-distance)
+        if len(raw_distances) > 0:
+            avg_fit = -float(np.mean(raw_distances))
+            best_fit = -float(np.min(raw_distances))
+            gen_avg_fitness.append(avg_fit)
+            gen_best_fitness.append(best_fit)
         
         es.tell(X, fitnesses)
         
         if gen % LOG_EVERY_N_GEN == 0:
+            # File log: full INFO
             logger.info(
                 f"[CoEv Gen {gen}] best_distance={-best_val:.4f} "
                 f"median={-float(np.median(fitnesses)):.4f} pop={len(fitnesses)} "
                 f"unique_morphs={len(seen_morphologies)}",
             )
-            console.log(
-                f"[CoEv] gen={gen} best_distance={-best_val:.4f} "
+            # Console: concise line only
+            print(
+                f"gen={gen} best_distance={-best_val:.4f} "
                 f"median={-float(np.median(fitnesses)):.4f} pop={len(fitnesses)} "
-                f"unique_morphs={len(seen_morphologies)}",
+                f"unique_morphs={len(seen_morphologies)}"
             )
         if gen >= gens:
             break
@@ -1081,7 +1132,61 @@ def train_coevolution_with_cma(
     logger.info("="*80)
     logger.info("CO-EVOLUTION COMPLETED")
     logger.info("="*80)
+    # Persist final best controller weights
+    _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _weights_path = DATA / f"controller_weights_coev_{_ts}.npz"
+    _save_controller_weights(nn, _weights_path)
+    _save_controller_weights(nn, DATA / "controller_weights_latest.npz")
     
+    # Plot and save fitness-over-time graphs
+    try:
+        if len(gen_avg_fitness) > 0:
+            # Average fitness over time
+            plt.figure(figsize=(8, 5))
+            plt.plot(range(1, len(gen_avg_fitness) + 1), gen_avg_fitness, label="Avg fitness (per gen)")
+            plt.xlabel("Generation")
+            plt.ylabel("Fitness (evaluate: -distance)")
+            plt.title("Average Fitness Over Time")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(DATA / "avg_fitness_over_time.png")
+            plt.close()
+
+            # Best fitness per generation and its running average
+            best_series = np.array(gen_best_fitness, dtype=float)
+            running_avg_best = np.cumsum(best_series) / (np.arange(len(best_series)) + 1)
+            plt.figure(figsize=(8, 5))
+            plt.plot(range(1, len(best_series) + 1), best_series, label="Best fitness (per gen)", alpha=0.6)
+            plt.plot(range(1, len(running_avg_best) + 1), running_avg_best, label="Running avg best", linewidth=2)
+            plt.xlabel("Generation")
+            plt.ylabel("Fitness (evaluate: -distance)")
+            plt.title("Best Fitness Over Time (with Running Average)")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(DATA / "best_fitness_over_time.png")
+            plt.close()
+
+            # Persist CSV for further analysis
+            try:
+                import csv
+                csv_path = DATA / "fitness_over_time.csv"
+                with open(csv_path, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["generation", "avg_fitness", "best_fitness", "running_avg_best"])
+                    running_sum = 0.0
+                    for i in range(len(gen_avg_fitness)):
+                        running_sum += float(gen_best_fitness[i])
+                        rb = running_sum / float(i + 1)
+                        writer.writerow([i + 1, gen_avg_fitness[i], gen_best_fitness[i], rb])
+                logger.info(f"Saved fitness metrics CSV to {csv_path}")
+            except Exception as e_csv:
+                logger.warning(f"Could not save fitness CSV: {e_csv}")
+        else:
+            logger.warning("No fitness data collected to plot.")
+    except Exception as e_plot:
+        logger.warning(f"Failed to generate fitness-over-time plots: {e_plot}")
+
     return robot, nn, best_fitness, best_x
     nn = _make_controller_for_robot_with_padding(robot, xc)
     best_fitness = -best_val
@@ -1240,6 +1345,8 @@ def main() -> None:
     logger.info(f"EXECUTION COMPLETED at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"Log saved to: {log_file_path}")
     logger.info("="*80)
+    # Ensure all logs are flushed to disk
+    logging.shutdown()
 
 
 if __name__ == "__main__":

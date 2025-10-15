@@ -21,6 +21,18 @@ DATA.mkdir(exist_ok=True)
 SPAWN_POS: list[float] = [-0.8, 0, 0.1]
 TARGET_POSITION: list[float] = [5, 0, 0.5]
 
+# Plot orientation controls for trajectory
+# Set these to True to adjust the plotted axes to match your preferred view
+PLOT_FLIP_X: bool = True
+PLOT_FLIP_Y: bool = False
+PLOT_SWAP_XY: bool = False
+
+# Fitness shaping: penalize lateral deviation from the straight path
+# Mean perpendicular distance to the line from SPAWN_POS to TARGET_POSITION (in meters)
+# is multiplied by this weight and added to the final distance before negation.
+# Increase to force straighter paths.
+CENTERLINE_PENALTY_WEIGHT: float = 0.5
+
 # Robot / genotype settings
 NUM_OF_MODULES: int = 30
 GENOTYPE_SIZE: int = 64
@@ -58,7 +70,7 @@ HINGE_ROTATION_CHOICES: list[str] = [
 # CMA-ES defaults
 CMA_POPSIZE: int = 48  # Increased for better exploration
 CMA_SIGMA0: float = 1.5  # Larger initial step size
-CMA_MAX_GENERATIONS: int = 3  # Run longer
+CMA_MAX_GENERATIONS: int = 10  # Run longer
 
 # Co-evolution controller dimensionality (fixed IO for stable CMA dimension)
 COEV_MAX_ACTUATORS: int = 32  # must be >= possible hinge count
